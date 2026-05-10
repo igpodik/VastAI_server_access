@@ -1,0 +1,18 @@
+{
+  "MAX_HOURLY_USD": 0.6,
+  "MIN_CPU_CORES_EFFECTIVE": 32.0,
+  "MIN_DISK_BW": 800.0,
+  "FAST_DISK_BW_OK_WITHOUT_NVME_LABEL": 1000.0,
+  "MIN_RELIABILITY": 0.97,
+  "DISK_SIZE_GB": 200.0,
+  "NUM_GPUS": 1,
+  "MIN_CPU_RAM_GB": 128.0,
+  "MIN_INET_DOWN_MBPS": 800.0,
+  "MIN_INET_UP_MBPS": 800.0,
+  "MIN_DIRECT_PORT_COUNT": 1,
+  "IMAGE": "pytorch/pytorch:latest",
+  "BEST_SERVER_ID": null,
+  "INSTANCE_ID": null,
+  "SSH_URL": null,
+  "EXPERIMENT_NAME": "baseline"
+}
