@@ -10,7 +10,7 @@
   "MIN_INET_DOWN_MBPS": 800.0,
   "MIN_INET_UP_MBPS": 800.0,
   "MIN_DIRECT_PORT_COUNT": 1,
-  "IMAGE": "pytorch/pytorch:latest",
+  "IMAGE": "docker.io/yourdockerhub/avito-cup-train:v1",
   "BEST_SERVER_ID": null,
   "INSTANCE_ID": null,
   "SSH_URL": null,

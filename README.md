@@ -7,6 +7,21 @@
 - SSH-ключ зарегистрирован в Vast, вход без пароля
 - Файл `secret.env`: строка `KEY="<api_key>"`
 
+## Docker-образ для GPU (холодный старт без pip на инстансе)
+
+Зависимости для обучения (`polars`, `lightgbm`, `catboost`, `scikit-learn`, `tqdm`) закреплены в [`docker/requirements-train.txt`](docker/requirements-train.txt); базовый образ — [`docker/Dockerfile`](docker/Dockerfile) (`pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime`). При несовпадении CUDA driver на хосте Vast и runtime в образе подберите другой тег на [Docker Hub PyTorch](https://hub.docker.com/r/pytorch/pytorch/tags).
+
+Сборка и публикация (из корня репозитория):
+
+```bash
+docker build -t yourdockerhub/avito-cup-train:v1 -f docker/Dockerfile .
+docker push yourdockerhub/avito-cup-train:v1
+```
+
+Для GHCR: логин в `ghcr.io`, тег вида `ghcr.io/<org>/<repo>/avito-cup-train:v1`.
+
+В [`src/scripts/server/config.json`](src/scripts/server/config.json) укажите полный тег образа (например `docker.io/yourdockerhub/avito-cup-train:v1` или префикс GHCR). Замените `yourdockerhub` на свой логин или организацию.
+
 ## Конфиг
 
 - `config.json` рядом со скриптами: пороги поиска, `IMAGE`, `DISK_SIZE_GB`, опционально `EXPERIMENT_NAME`

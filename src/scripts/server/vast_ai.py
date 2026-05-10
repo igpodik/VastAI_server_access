@@ -396,7 +396,7 @@ def cmd_start(_args: argparse.Namespace) -> None:
         id=offer_id,
         image=IMAGE,
         disk=DISK_SIZE_GB,
-        onstart_cmd="echo started && nvidia-smi && pip install --upgrade pip && pip install -U polars lightgbm catboost scikit-learn tqdm",
+        onstart_cmd="echo started && nvidia-smi",
         python_utf8=True,
         lang_utf8=True,
         cancel_unavail=True,
