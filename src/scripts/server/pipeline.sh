@@ -69,8 +69,17 @@ echo "=== [2/6] Запуск инстанса ==="
 
 eval "$("$PYTHON" "$SSH_ENV")"
 
-SSH_BASE=(
+SSH_BATCH=(
     ssh
+    -p "${PIPELINE_SSH_PORT}"
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=accept-new
+    "${PIPELINE_SSH_USER}@${PIPELINE_SSH_HOST}"
+)
+# Псевдо-TTY: потоковый stdout/stderr в локальный терминал (download/train).
+SSH_STREAM=(
+    ssh
+    -tt
     -p "${PIPELINE_SSH_PORT}"
     -o BatchMode=yes
     -o StrictHostKeyChecking=accept-new
@@ -81,7 +90,7 @@ RSYNC_SSH_CMD="ssh -p ${PIPELINE_SSH_PORT} -o BatchMode=yes -o StrictHostKeyChec
 
 echo ""
 echo "=== Синхронизация experiments/${EXPERIMENT_NAME} и скриптов на сервер ==="
-"${SSH_BASE[@]}" "mkdir -p ${REMOTE_RUN}/experiment"
+"${SSH_BATCH[@]}" "mkdir -p ${REMOTE_RUN}/experiment"
 rsync -avz --mkpath -e "$RSYNC_SSH_CMD" \
     "${LOCAL_EXP}/" \
     "${PIPELINE_SSH_USER}@${PIPELINE_SSH_HOST}:${REMOTE_RUN}/experiment/"
@@ -90,15 +99,17 @@ for _f in download_data_on_server.sh train_models.sh; do
         "${SCRIPT_DIR}/${_f}" \
         "${PIPELINE_SSH_USER}@${PIPELINE_SSH_HOST}:${REMOTE_RUN}/${_f}"
 done
-"${SSH_BASE[@]}" "chmod +x ${REMOTE_RUN}/download_data_on_server.sh ${REMOTE_RUN}/train_models.sh"
+"${SSH_BATCH[@]}" "chmod +x ${REMOTE_RUN}/download_data_on_server.sh ${REMOTE_RUN}/train_models.sh"
 
 echo ""
-echo "=== [3/6] Скачивание данных на инстансе (SSH) ==="
-"${SSH_BASE[@]}" bash -lc "set -euo pipefail; cd ${REMOTE_RUN} && bash ./download_data_on_server.sh"
+echo "=== [3/6] Скачивание данных на инстансе (SSH, лог в реальном времени) ==="
+"${SSH_STREAM[@]}" env PYTHONUNBUFFERED=1 bash -lc \
+    "set -euo pipefail; cd ${REMOTE_RUN} && exec bash ./download_data_on_server.sh"
 
 echo ""
-echo "=== [4/6] Обучение на инстансе (SSH) ==="
-"${SSH_BASE[@]}" bash -lc "set -euo pipefail; cd ${REMOTE_RUN} && bash ./train_models.sh"
+echo "=== [4/6] Обучение на инстансе (SSH, лог в реальном времени) ==="
+"${SSH_STREAM[@]}" env PYTHONUNBUFFERED=1 bash -lc \
+    "set -euo pipefail; cd ${REMOTE_RUN} && exec bash ./train_models.sh"
 
 echo ""
 echo "=== [5/6] Выгрузка артефактов локально ==="
