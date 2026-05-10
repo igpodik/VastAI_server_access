@@ -28,7 +28,7 @@ bash pipeline.sh
 
 Шаги: `search` -> `start` -> rsync -> на сервере `download_data_on_server.sh` -> `train_models.sh` -> `artifacts-download` -> `stop`.
 
-Артефакты: `src/experiments/<YYYYMMDD_HHMMSS>_<EXPERIMENT_NAME>/`.
+Артефакты: `src/results/<YYYYMMDD_HHMMSS>/<EXPERIMENT_NAME>/`.
 
 ## Только Vast API (без pipeline)
 

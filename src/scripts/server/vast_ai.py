@@ -67,8 +67,8 @@ _REMOTE_DATA_DIR = "/workspace/data"
 _REMOTE_RESULTS_DIR = "/workspace/results"
 _REMOTE_TRAIN_SCRIPT = "/workspace/train.py"
 
-# Локальный каталог артефактов (выгрузка с инстанса): repo/src/experiments/<timestamp>_<run>/
-_EXPERIMENTS_DIR = Path(__file__).resolve().parents[2] / "experiments"
+# Локальная выгрузка с инстанса: src/results/<datetime>/<EXPERIMENT_NAME>/
+_RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -466,10 +466,10 @@ def cmd_artifacts_download(_args: argparse.Namespace) -> None:
         sys.exit(1)
 
     exp = (os.environ.get("EXPERIMENT_NAME") or cfg.get("EXPERIMENT_NAME") or "").strip()
-    safe = exp.replace("/", "_").replace("\\", "_") or "run"
+    leaf = exp.replace("/", "_").replace("\\", "_") if exp else "run"
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = _EXPERIMENTS_DIR / f"{ts}_{safe}"
+    dest = _RESULTS_DIR / ts / leaf
     dest.mkdir(parents=True, exist_ok=True)
 
     if shutil.which("rsync") is None:
@@ -523,7 +523,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("start", help="Создать инстанс по BEST_SERVER_ID и дождаться running")
     sub.add_parser("data-download", help="Скачать датасет с Яндекс-облака на инстанс")
     sub.add_parser("train", help="Запустить entrypoint обучения на инстансе")
-    sub.add_parser("artifacts-download", help="Скачать артефакты с инстанса в experiments/<datetime>/")
+    sub.add_parser("artifacts-download", help="Скачать артефакты в src/results/<datetime>/<experiment>/")
     sub.add_parser("stop", help="Удалить (destroy) инстанс")
 
     return parser
