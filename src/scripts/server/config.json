@@ -10,9 +10,10 @@
   "MIN_INET_DOWN_MBPS": 800.0,
   "MIN_INET_UP_MBPS": 800.0,
   "MIN_DIRECT_PORT_COUNT": 1,
+  "MIN_CUDA_MAX_GOOD": 12.1,
   "IMAGE": "docker.io/igpodik/avito-cup-train:v1",
-  "BEST_SERVER_ID": 36424880,
-  "INSTANCE_ID": 36563038,
-  "SSH_URL": "ssh://root@ssh3.vast.ai:13038",
+  "BEST_SERVER_ID": 33574071,
+  "INSTANCE_ID": 36569851,
+  "SSH_URL": "ssh://root@ssh3.vast.ai:19850",
   "EXPERIMENT_NAME": "baseline"
 }

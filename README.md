@@ -11,7 +11,7 @@
 
 ## Docker-образ для GPU (холодный старт без pip на инстансе)
 
-Базовый образ: [`docker/Dockerfile`](docker/Dockerfile) (`pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime`). Зависимости обучения перечислены в [`docker/requirements-train.txt`](docker/requirements-train.txt): прямые пакеты (`polars-u64-idx`, `lightgbm`, `catboost`, `scikit-learn`, `tqdm` и др.) и **закреплённые транзитивные** версии (`numpy`, `pandas`, `scipy`, `matplotlib`, …) для воспроизводимости сборки.
+Базовый образ: [`docker/Dockerfile`](docker/Dockerfile) (`pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime`). В образе через **`apt-get`** (без установки на инстансе при скачивании) ставятся **`ca-certificates`**, **`curl`**, **`unzip`** — они нужны [`download_data_on_server.sh`](src/scripts/server/download_data_on_server.sh). Затем **`pip install -r`** [`docker/requirements-train.txt`](docker/requirements-train.txt): прямые пакеты (`polars-u64-idx`, `lightgbm`, `catboost`, …) и **закреплённые транзитивные** версии.
 
 **`polars-u64-idx`** — та же библиотека Polars с 64-битными индексами; для больших таблиц (co-visitation и т.п.) обычный wheel `polars` может упасть с сообщением вроде `Polars' maximum length reached`.
 
@@ -26,11 +26,20 @@ docker push yourdockerhub/avito-cup-train:v1
 
 Для GHCR: логин в `ghcr.io`, тег вида `ghcr.io/<org>/<repo>/avito-cup-train:v1`.
 
-В [`src/scripts/server/config.json`](src/scripts/server/config.json) укажите полный тег образа в поле `IMAGE` (например `docker.io/yourdockerhub/avito-cup-train:v1`). После смены `requirements-train.txt` пересоберите и запушьте образ, чтобы инстансы подтягивали актуальный слой.
+В [`src/scripts/server/config.json`](src/scripts/server/config.json) укажите полный тег образа в поле `IMAGE` (например `docker.io/yourdockerhub/avito-cup-train:v1`). После смены Dockerfile или `requirements-train.txt` пересоберите и запушьте образ.
+
+Смоук-тест образа **без датасета и без Vast** (проверка `curl`/`unzip` и импортов, как на инстансе):
+
+```bash
+docker run --rm docker.io/igpodik/avito-cup-train:v1 bash -lc \
+  'curl --version | head -n1; unzip -v | head -n1; python3 -c "import polars, catboost"'
+```
+
+Замените тег на свой из `IMAGE`, если отличается.
 
 ## Конфиг
 
-- `config.json` рядом со скриптами: пороги поиска офферов, `IMAGE`, `DISK_SIZE_GB`, опционально `EXPERIMENT_NAME`
+- `config.json` рядом со скриптами: пороги поиска офферов, `IMAGE`, `DISK_SIZE_GB`, **`MIN_CUDA_MAX_GOOD`** — после ответа API у каждого оффера проверяется **`cuda_max_good`** (макс. CUDA по драйверу хоста): значение должно быть **≥** этому порогу (как правило, совпадает с minor CUDA runtime образа, например **`12.1`** для `pytorch/...-cuda12.1-...`). В строку запроса Vast `cuda_vers` **не** подставляется; опционально `EXPERIMENT_NAME`
 - После `search` / `start` скриптами подставляются `BEST_SERVER_ID`, `INSTANCE_ID`, `SSH_URL` (не правьте вручную без необходимости)
 
 ## Код эксперимента
@@ -47,7 +56,7 @@ export PYTHON=python3             # или путь к venv
 bash pipeline.sh
 ```
 
-Шаги: `search` → `start` → rsync кода и скриптов → на сервере [`download_data_on_server.sh`](src/scripts/server/download_data_on_server.sh) (при необходимости ставит `curl`/`unzip` через `apt-get` или `apk`) → [`train_models.sh`](src/scripts/server/train_models.sh) → `artifacts-download` → `stop`.
+Шаги: `search` → `start` → rsync → на сервере [`download_data_on_server.sh`](src/scripts/server/download_data_on_server.sh) (параллельные `curl`, **последовательная** распаковка zip в общий `train_data/`, без `apt-get` на лету, при необходимости переименование `eval_user_events.parquet` → `eval_user_events.pq`) → [`verify_baseline_prereqs.sh`](src/scripts/server/verify_baseline_prereqs.sh) (файлы данных, импорты, `py_compile` baseline) → [`train_models.sh`](src/scripts/server/train_models.sh) → `artifacts-download` → `stop`.
 
 Артефакты локально: `src/results/<YYYYMMDD_HHMMSS>/<EXPERIMENT_NAME>/`.
 
@@ -75,3 +84,4 @@ python vast_ai.py stop
 - SSH/rsync: проверьте `SSH_KEY`, `SSH_URL`, firewall, `BatchMode=yes` (без интерактива)
 - Нет каталога эксперимента: создайте `src/experiments/<EXPERIMENT_NAME>/`
 - Обучение падает на Polars «maximum length»: используйте образ с **`polars-u64-idx`** из текущего `requirements-train.txt`
+- Ошибки **`unzip` / `checkdir` / `train_data`** при параллельной распаковке: в скрипте скачивания архивы распаковываются **по очереди**; обновите скрипт на сервере и перезапустите шаг данных

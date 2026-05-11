@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Локальный оркестратор Vast.ai: search → start → rsync на сервер → SSH download/train →
-# выгрузка артефактов → destroy инстанса.
+# Локальный оркестратор Vast.ai: search → start → rsync → download → verify → train →
+# артефакты → destroy инстанса.
 #
 # Переменные:
 #   EXPERIMENT_NAME — имя каталога под src/experiments/<имя> (иначе из config.json).
@@ -61,11 +61,11 @@ fi
 REMOTE_RUN="~/avito_cup/run/${EXPERIMENT_NAME}"
 
 echo ""
-echo "=== [1/6] Поиск сервера ==="
+echo "=== [1/7] Поиск сервера ==="
 "$PYTHON" "$VAST" search
 
 echo ""
-echo "=== [2/6] Запуск инстанса ==="
+echo "=== [2/7] Запуск инстанса ==="
 "$PYTHON" "$VAST" start
 
 eval "$("$PYTHON" "$SSH_ENV")"
@@ -104,29 +104,34 @@ echo "=== Синхронизация experiments/${EXPERIMENT_NAME} и скри�
 rsync -avz --mkpath -e "$RSYNC_SSH_CMD" \
     "${LOCAL_EXP}/" \
     "${PIPELINE_SSH_USER}@${PIPELINE_SSH_HOST}:${REMOTE_RUN}/experiment/"
-for _f in download_data_on_server.sh train_models.sh; do
+for _f in download_data_on_server.sh train_models.sh verify_baseline_prereqs.sh; do
     rsync -avz -e "$RSYNC_SSH_CMD" \
         "${SCRIPT_DIR}/${_f}" \
         "${PIPELINE_SSH_USER}@${PIPELINE_SSH_HOST}:${REMOTE_RUN}/${_f}"
 done
-"${SSH_BATCH[@]}" "chmod +x ${REMOTE_RUN}/download_data_on_server.sh ${REMOTE_RUN}/train_models.sh"
+"${SSH_BATCH[@]}" "chmod +x ${REMOTE_RUN}/download_data_on_server.sh ${REMOTE_RUN}/train_models.sh ${REMOTE_RUN}/verify_baseline_prereqs.sh"
 
 echo ""
-echo "=== [3/6] Скачивание данных на инстансе (SSH, лог в реальном времени) ==="
+echo "=== [3/7] Скачивание данных на инстансе (SSH, лог в реальном времени) ==="
 "${SSH_STREAM[@]}" env PYTHONUNBUFFERED=1 bash -lc \
     "set -euo pipefail; cd ${REMOTE_RUN} && exec bash ./download_data_on_server.sh"
 
 echo ""
-echo "=== [4/6] Обучение на инстансе (SSH, лог в реальном времени) ==="
+echo "=== [4/7] Проверка данных и окружения (baseline, без обучения) ==="
+"${SSH_STREAM[@]}" env PYTHONUNBUFFERED=1 bash -lc \
+    "set -euo pipefail; cd ${REMOTE_RUN} && DATA_DIR=\$HOME/avito_cup/data RUN_DIR=\$HOME/avito_cup/run/${EXPERIMENT_NAME} bash ./verify_baseline_prereqs.sh"
+
+echo ""
+echo "=== [5/7] Обучение на инстансе (SSH, лог в реальном времени) ==="
 "${SSH_STREAM[@]}" env PYTHONUNBUFFERED=1 bash -lc \
     "set -euo pipefail; cd ${REMOTE_RUN} && exec bash ./train_models.sh"
 
 echo ""
-echo "=== [5/6] Выгрузка артефактов локально ==="
+echo "=== [6/7] Выгрузка артефактов локально ==="
 EXPERIMENT_NAME="${EXPERIMENT_NAME}" "$PYTHON" "$VAST" artifacts-download
 
 echo ""
-echo "=== [6/6] Удаление инстанса ==="
+echo "=== [7/7] Удаление инстанса ==="
 "$PYTHON" "$VAST" stop
 
 trap - EXIT

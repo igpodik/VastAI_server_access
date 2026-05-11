@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Скачивание датасета DataFest с Яндекс-облака на Vast-инстанс.
-# При необходимости ставит curl/unzip (apt-get или apk), затем параллельный curl и unzip.
+# Параллельно: curl. Распаковка zip — последовательно (общий каталог train_data/).
 #
+# Требуется: curl и unzip в PATH (в GPU-образе они ставятся в docker/Dockerfile).
 # Число параллельных загрузок: PARALLEL (по умолчанию 8).
 # Запуск: bash download_data_on_server.sh
 
@@ -12,24 +13,14 @@ PARALLEL="${PARALLEL:-8}"
 mkdir -p ~/avito_cup/data
 cd ~/avito_cup/data
 
-# Минимальные образы (PyTorch runtime и т.п.) часто без unzip/curl — ставим из репозитория.
-_ensure_curl_unzip() {
-  if command -v curl >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
-    return 0
-  fi
-  export DEBIAN_FRONTEND=noninteractive
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq
-    apt-get install -y -qq ca-certificates curl unzip
-  elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache curl unzip ca-certificates
-  fi
-  command -v curl >/dev/null 2>&1 || {
-    echo "curl не найден и не установлен (нужен apt-get или apk)." >&2
-    exit 1
-  }
-}
-_ensure_curl_unzip
+if ! command -v curl >/dev/null 2>&1; then
+  echo "Нужен curl в PATH (используйте обучающий Docker-образ или установите curl)." >&2
+  exit 1
+fi
+if ! command -v unzip >/dev/null 2>&1; then
+  echo "Нужен unzip в PATH (используйте обучающий Docker-образ или установите unzip)." >&2
+  exit 1
+fi
 
 BASE="https://storage.yandexcloud.net/datafest2026/datafest_2026_v2_v4"
 
@@ -49,23 +40,13 @@ done
 
 printf '%s\n' "${urls[@]}" | xargs -n 1 -P "${PARALLEL}" curl -fLSs -O
 
-pids=()
 for z in eval_user_events.zip train_000-019.zip train_020-039.zip train_040-059.zip train_060-079.zip train_080-099.zip; do
-  (
-    if command -v unzip >/dev/null 2>&1; then
-      unzip -o -q "${z}"
-    else
-      ZIP="${z}" python3 -c 'import os, zipfile; zipfile.ZipFile(os.environ["ZIP"]).extractall(".")'
-    fi
-  ) &
-  pids+=($!)
+  unzip -o -q "${z}"
 done
-_st=0
-for pid in "${pids[@]}"; do
-  wait "${pid}" || _st=1
-done
-if ((_st)); then
-  exit "${_st}"
+
+# baseline ожидает eval_user_events.pq; в архиве часто eval_user_events.parquet
+if [[ -f eval_user_events.parquet && ! -f eval_user_events.pq ]]; then
+  mv -f eval_user_events.parquet eval_user_events.pq
 fi
 
 rm -f eval_user_events.zip train_000-019.zip train_020-039.zip train_040-059.zip train_060-079.zip train_080-099.zip

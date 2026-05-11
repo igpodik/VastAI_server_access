@@ -33,6 +33,7 @@ from config import (
     MAX_HOURLY_USD,
     MIN_CPU_CORES_EFFECTIVE,
     MIN_CPU_RAM_GB,
+    MIN_CUDA_MAX_GOOD,
     MIN_DIRECT_PORT_COUNT,
     MIN_DISK_BW,
     MIN_INET_DOWN_MBPS,
@@ -135,7 +136,11 @@ def _disk_ok(o: dict[str, Any]) -> bool:
 
 
 def _base_query(gpu_token: Optional[str] = None) -> str:
-    """Запрос к search_offers. Без gpu_token — любая видеокарта (остальные пороги те же)."""
+    """Запрос к search_offers. Без gpu_token — любая видеокарта (остальные пороги те же).
+
+    Ограничение по CUDA (cuda_max_good) не задаётся в строке запроса — оно проверяется
+    после получения офферов, см. _first_failed_criterion.
+    """
     tail = (
         "num_gpus=1 "
         "verified=true "
@@ -171,7 +176,11 @@ def _first_failed_criterion(
     *,
     require_preferred_gpu: bool = True,
 ) -> Optional[tuple[str, str]]:
-    """Первое несоответствие: (короткий_ключ_группы, подробное сообщение). OK → None."""
+    """Первое несоответствие: (короткий_ключ_группы, подробное сообщение). OK → None.
+
+    Проверка cuda_max_good (совместимость с MIN_CUDA_MAX_GOOD / Docker runtime) выполняется
+    после остальных критериев — отдельным шагом по уже полученным офферам, без cuda_vers в API-запросе.
+    """
     oid = o.get("id")
     if _f(o.get("num_gpus")) != float(NUM_GPUS):
         return (
@@ -247,6 +256,18 @@ def _first_failed_criterion(
             "reliability",
             f"нужно >{MIN_RELIABILITY}, факт {_f(o.get('reliability')):.5f} (offer_id={oid})",
         )
+    cuda_mg = o.get("cuda_max_good")
+    if cuda_mg is None:
+        return (
+            "cuda_max_good",
+            f"поле cuda_max_good отсутствует (offer_id={oid})",
+        )
+    if _f(cuda_mg) < MIN_CUDA_MAX_GOOD:
+        return (
+            "cuda_max_good",
+            f"хост cuda_max_good {_f(cuda_mg):.2f} < MIN_CUDA_MAX_GOOD {MIN_CUDA_MAX_GOOD} "
+            f"(runtime Docker), offer_id={oid}",
+        )
     return None
 
 
@@ -315,7 +336,10 @@ def _print_top(o: dict[str, Any]) -> None:
     print("\n=== TOP 1 ===")
     print(f"  rank (cpu_eff, ram_gb, disk_bw, inet, dlperf, dlperf/$) = ({rk[0]:.3g}, {rk[1]:.1f}, {rk[2]:.0f}, {rk[3]:.0f}, {rk[4]:.2f}, {rk[5]:.2f})")
     print(f"  offer_id={o.get('id')}  machine_id={o.get('machine_id')}  host_id={o.get('host_id')}")
-    print(f"  gpu: {o.get('gpu_name')}  vram_gb={_gpu_ram_gb(o):.1f}")
+    print(
+        f"  gpu: {o.get('gpu_name')}  vram_gb={_gpu_ram_gb(o):.1f}  "
+        f"cuda_max_good={_f(o.get('cuda_max_good')):.2f}"
+    )
     print(f"  cpu: {o.get('cpu_name')}  cores_eff={_f(o.get('cpu_cores_effective')):.3g}  ram_gb={_cpu_ram_gb(o):.1f}")
     print(f"  disk: {o.get('disk_name')}  space_gb={_f(o.get('disk_space')):.1f}  bw={_f(o.get('disk_bw')):.0f}")
     print(f"  net: down={_f(o.get('inet_down')):.0f}  up={_f(o.get('inet_up')):.0f}")
@@ -335,6 +359,11 @@ def cmd_search(_args: argparse.Namespace) -> None:
     vast = _make_vast(key)
     kw = dict(type="on-demand", no_default=False, limit=100,
                disable_bundling=False, storage=DISK_SIZE_GB, order="score")
+
+    print(
+        "После выборки офферов: доп. проверка cuda_max_good "
+        f"(≥ {MIN_CUDA_MAX_GOOD}, как у CUDA runtime в Docker-образе из config).",
+    )
 
     raw_4090 = vast.search_offers(query=_base_query("RTX_4090"), **kw)
     raw_5090 = vast.search_offers(query=_base_query("RTX_5090"), **kw)

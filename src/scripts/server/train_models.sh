@@ -7,7 +7,7 @@ set -euo pipefail
 echo "Запускаем обучение и инференс CatBoost..."
 
 python -u experiment/baseline.py \
-    --data-dir ~/avito_cup/data \
+    --data-dir "${HOME}/avito_cup/data" \
     --out submission.csv \
     -v
 

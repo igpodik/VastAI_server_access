@@ -8,7 +8,7 @@ Memory discipline:
   - POLARS_MAX_THREADS capped for 32-core hosts
 
 Layout: data/train_data/*.parquet, data/item_features.parquet,
-        data/eval_users.csv, data/eval_user_events.pq, data/contact_eids.csv
+        data/eval_users.csv, data/eval_user_events.pq (или .parquet), data/contact_eids.csv
 """
 
 import argparse
@@ -576,6 +576,10 @@ def run_pipeline(data_dir: Path, out_csv: Path, *, use_gpu: bool = True) -> None
     item_features = data_dir / "item_features.parquet"
     eval_users = data_dir / "eval_users.csv"
     eval_events = data_dir / "eval_user_events.pq"
+    if not eval_events.exists():
+        _alt_ev = data_dir / "eval_user_events.parquet"
+        if _alt_ev.exists():
+            eval_events = _alt_ev
     contact_eids = data_dir / "contact_eids.csv"
 
     for p in (item_features, eval_users, eval_events, contact_eids):
@@ -645,7 +649,11 @@ def main(argv: list[str] | None = None) -> None:
         pass
     os.environ.setdefault("POLARS_MAX_THREADS", "28")
     set_random_seed(RANDOM_SEED)
-    run_pipeline(args.data_dir.resolve(), args.out.resolve(), use_gpu=not args.cpu_only)
+    run_pipeline(
+        args.data_dir.expanduser().resolve(),
+        args.out.expanduser().resolve(),
+        use_gpu=not args.cpu_only,
+    )
 
 
 if __name__ == "__main__":

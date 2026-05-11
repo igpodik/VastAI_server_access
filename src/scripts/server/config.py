@@ -20,6 +20,7 @@ _KEYS_FLOAT = (
     "MIN_INET_DOWN_MBPS",
     "MIN_INET_UP_MBPS",
     "MIN_DIRECT_PORT_COUNT",
+    "MIN_CUDA_MAX_GOOD",
 )
 _KEYS_STR = ("IMAGE",)
 
@@ -54,6 +55,7 @@ MIN_CPU_RAM_GB: float = float(_data["MIN_CPU_RAM_GB"])
 MIN_INET_DOWN_MBPS: float = float(_data["MIN_INET_DOWN_MBPS"])
 MIN_INET_UP_MBPS: float = float(_data["MIN_INET_UP_MBPS"])
 MIN_DIRECT_PORT_COUNT: int = int(_data["MIN_DIRECT_PORT_COUNT"])
+MIN_CUDA_MAX_GOOD: float = float(_data["MIN_CUDA_MAX_GOOD"])
 IMAGE: str = str(_data["IMAGE"])
 
 _best_raw: Any = _data.get("BEST_SERVER_ID")
