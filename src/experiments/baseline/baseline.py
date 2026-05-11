@@ -3,9 +3,9 @@
 AvitoTech ML CUP 2026 — retrieval + ranking baseline (Polars + CatBoost).
 
 Memory discipline:
-  - scan_parquet / LazyFrame, collect(streaming=True) on heavy steps
-  - gc.collect() after large collects
-  - POLARS_MAX_THREADS capped for 32-core hosts
+  - train parquet processed in sorted file chunks (peak RAM ~ one shard + aggregates)
+  - POLARS_MAX_THREADS = TRAIN_HOST_RAM_GB // 6 (default RAM 128 GiB → 21 threads)
+  - gc.collect() after major steps
 
 Layout: data/train_data/*.parquet, data/item_features.parquet,
         data/eval_users.csv, data/eval_user_events.pq (или .parquet), data/contact_eids.csv
@@ -20,7 +20,7 @@ import random
 import resource
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import polars as pl
 
@@ -50,6 +50,9 @@ FB_PAD_WIDE = SUBMISSION_K * 3
 
 RANDOM_SEED = 42
 
+# Сколько файлов train накапливать в списке рёбер co-vis перед слиянием (пик RAM).
+COVIS_EDGE_FOLD_EVERY = 6
+
 
 def set_random_seed(seed: int = RANDOM_SEED) -> None:
     random.seed(seed)
@@ -71,6 +74,72 @@ def _log_mem(stage: str) -> None:
         logging.info("[mem] %s | ru_maxrss=%s", stage, usage)
     except Exception:
         logging.info("[mem] %s", stage)
+
+
+def _train_parquet_paths(data_dir: Path) -> list[Path]:
+    d = data_dir / "train_data"
+    paths = sorted(d.glob("*.parquet"))
+    if not paths:
+        raise FileNotFoundError(f"Нет parquet в {d}")
+    return paths
+
+
+def _aggregate_train_counts_by_file(paths: list[Path]) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Глобальные item_pop, ucnt, icnt за один проход по файлам (без scan по glob)."""
+    acc_ip: Optional[pl.DataFrame] = None
+    acc_uc: Optional[pl.DataFrame] = None
+    for path in paths:
+        chunk = (
+            pl.scan_parquet(str(path))
+            .filter(pl.col("timestamp") < CUTOFF_MS)
+            .select(["user_id", "item_id"])
+        )
+        ip = (
+            chunk.group_by("item_id")
+            .len()
+            .rename({"len": "pop"})
+            .collect(streaming=True)
+        )
+        uc = (
+            chunk.group_by("user_id")
+            .len()
+            .rename({"len": "user_event_cnt"})
+            .collect(streaming=True)
+        )
+        acc_ip = ip if acc_ip is None else (
+            pl.concat([acc_ip, ip], how="vertical").group_by("item_id").agg(pl.col("pop").sum())
+        )
+        acc_uc = uc if acc_uc is None else (
+            pl.concat([acc_uc, uc], how="vertical")
+            .group_by("user_id")
+            .agg(pl.col("user_event_cnt").sum())
+        )
+        del chunk, ip, uc
+        gc.collect()
+    assert acc_ip is not None and acc_uc is not None
+    icnt = acc_ip.rename({"pop": "item_event_cnt"})
+    _log_mem("after _aggregate_train_counts_by_file")
+    return acc_ip, acc_uc, icnt
+
+
+def _nu_items_multi_user(paths: list[Path]) -> pl.DataFrame:
+    """item_id с числом уникальных user_id ≥ 2 (глобально по train)."""
+    scans = [
+        pl.scan_parquet(str(p))
+        .filter(pl.col("timestamp") < CUTOFF_MS)
+        .select(["item_id", "user_id"])
+        for p in paths
+    ]
+    lf = pl.concat(scans, how="vertical")
+    out = (
+        lf.group_by("item_id")
+        .agg(pl.col("user_id").n_unique().alias("nu"))
+        .filter(pl.col("nu") >= 2)
+        .select("item_id")
+        .collect(streaming=True)
+    )
+    gc.collect()
+    return out
 
 
 def map_vertical_to_bucket_expr(col: str = "vertical_id") -> pl.Expr:
@@ -103,26 +172,46 @@ def load_target_eids(path: Path) -> list[int]:
     return out
 
 
-def build_vertical_top160_fallback(
-    train_glob: str,
+def build_vertical_top160_fallback_paths(
+    paths: list[Path],
     item_features_path: Path,
     target_eids: Iterable[int],
 ) -> pl.DataFrame:
-    """Top-160 item_id per vertical_id by contact (eid ∈ target_eids) count."""
+    """Top-160 item_id per vertical_id by contact (eid ∈ target_eids), по файлам train."""
     eid_set = list({int(x) for x in target_eids})
     items = pl.scan_parquet(str(item_features_path)).select(["item_id", "vertical_id"])
-
-    lf = (
-        pl.scan_parquet(train_glob)
-        .filter(pl.col("timestamp") < CUTOFF_MS)
-        .filter(pl.col("eid").is_in(eid_set))
-        .join(items, on="item_id", how="inner")
-        .group_by(["vertical_id", "item_id"])
-        .agg(pl.len().alias("contact_cnt"))
-    )
-
-    ranked = (
-        lf.with_columns(
+    acc: Optional[pl.DataFrame] = None
+    for path in paths:
+        part = (
+            pl.scan_parquet(str(path))
+            .filter(pl.col("timestamp") < CUTOFF_MS)
+            .filter(pl.col("eid").is_in(eid_set))
+            .join(items, on="item_id", how="inner")
+            .group_by(["vertical_id", "item_id"])
+            .agg(pl.len().alias("contact_cnt"))
+            .collect(streaming=True)
+        )
+        if part.is_empty():
+            del part
+            gc.collect()
+            continue
+        acc = part if acc is None else (
+            pl.concat([acc, part], how="vertical")
+            .group_by(["vertical_id", "item_id"])
+            .agg(pl.col("contact_cnt").sum())
+        )
+        del part
+        gc.collect()
+    if acc is None:
+        acc = pl.DataFrame(
+            schema={
+                "vertical_id": pl.Int32,
+                "item_id": pl.UInt32,
+                "contact_cnt": pl.UInt32,
+            }
+        )
+    df = (
+        acc.with_columns(
             pl.col("contact_cnt")
             .rank(method="ordinal", descending=True)
             .over("vertical_id")
@@ -131,75 +220,156 @@ def build_vertical_top160_fallback(
         .filter(pl.col("rk") <= FALLBACK_TOP_K)
         .select(["vertical_id", "item_id", "contact_cnt", "rk"])
     )
-
-    df = ranked.collect(streaming=True)
+    del acc
     gc.collect()
     _log_mem("after build_vertical_top160_fallback")
     logging.info("Fallback rows=%s (<=160 per vertical_id)", f"{df.height:,}")
     return df
 
 
-# ---------------------------------------------------------------------------
-# Step 2 — co-visitation + semantic pools
-# ---------------------------------------------------------------------------
-
-
-def build_co_visitation(train_glob: str) -> pl.DataFrame:
-    """Next-item co-vis: shift(-1) over user_id; top-50 next_item per item_id."""
-    base = (
-        pl.scan_parquet(train_glob)
-        .filter(pl.col("timestamp") < CUTOFF_MS)
-        .select(["user_id", "item_id", "timestamp"])
+def _merge_co_edge_parts(parts: list[pl.DataFrame]) -> pl.DataFrame:
+    if not parts:
+        return pl.DataFrame(
+            schema={
+                "item_id": pl.UInt32,
+                "next_item": pl.UInt32,
+                "cnt": pl.UInt64,
+            }
+        )
+    return (
+        pl.concat(parts, how="vertical")
+        .group_by(["item_id", "next_item"])
+        .agg(pl.col("cnt").sum())
     )
 
-    nu = (
-        base.group_by("item_id")
-        .agg(pl.col("user_id").n_unique().alias("nu"))
-        .filter(pl.col("nu") >= 2)
-        .select("item_id")
-    )
 
-    seq = (
-        base.join(nu, on="item_id", how="inner")
-        .sort(["user_id", "timestamp"])
-        .with_columns(pl.col("item_id").shift(-1).over("user_id").alias("next_item"))
-        .filter(pl.col("next_item").is_not_null())
-        .filter(pl.col("item_id") != pl.col("next_item"))
-    )
+def build_co_visitation_paths(paths: list[Path], nu_items: pl.DataFrame) -> pl.DataFrame:
+    """Co-vis по файлам + carry last_item_id; nu_items — глобальный фильтр item_id."""
+    carry = pl.DataFrame(schema={"user_id": pl.UInt32, "last_item_id": pl.UInt32})
+    edge_fold_buf: list[pl.DataFrame] = []
+    folded: Optional[pl.DataFrame] = None
 
-    edges = (
-        seq.group_by(["item_id", "next_item"])
-        .len()
-        .rename({"len": "cnt"})
-        .sort(["item_id", "cnt"], descending=[False, True])
-        .group_by("item_id", maintain_order=True)
-        .head(COVIS_TOP_K)
-        .rename({"next_item": "cand_item_id"})
-    )
+    def flush_edges() -> None:
+        nonlocal folded, edge_fold_buf
+        if not edge_fold_buf:
+            return
+        chunk = _merge_co_edge_parts(edge_fold_buf)
+        edge_fold_buf.clear()
+        folded = chunk if folded is None else (
+            pl.concat([folded, chunk], how="vertical")
+            .group_by(["item_id", "next_item"])
+            .agg(pl.col("cnt").sum())
+        )
+        del chunk
+        gc.collect()
 
-    df = edges.collect(streaming=True)
+    for path in paths:
+        raw = (
+            pl.scan_parquet(str(path))
+            .filter(pl.col("timestamp") < CUTOFF_MS)
+            .select(["user_id", "item_id", "timestamp"])
+            .collect(streaming=True)
+        )
+        if raw.is_empty():
+            gc.collect()
+            continue
+
+        raw = raw.sort(["user_id", "timestamp"])
+        carry_prev = carry
+        tails = raw.group_by("user_id").agg(pl.col("item_id").last().alias("last_item_id"))
+        users_in_file = tails.select("user_id")
+        carry_from_prev = carry_prev.join(users_in_file, on="user_id", how="anti")
+        carry = pl.concat([carry_from_prev, tails], how="vertical")
+
+        seq = raw.join(nu_items, on="item_id", how="inner").sort(["user_id", "timestamp"])
+        del raw, tails
+        if seq.is_empty():
+            del seq
+            gc.collect()
+            continue
+
+        seq = seq.with_columns(
+            (pl.col("user_id") != pl.col("user_id").shift(1)).fill_null(True).alias("_uf"),
+        )
+        b_joined = seq.filter(pl.col("_uf")).join(carry_prev, on="user_id", how="left")
+        b_edges = b_joined.filter(
+            pl.col("last_item_id").is_not_null()
+            & (pl.col("last_item_id") != pl.col("item_id"))
+        ).select(
+            [
+                pl.col("last_item_id").cast(pl.UInt32).alias("item_id"),
+                pl.col("item_id").cast(pl.UInt32).alias("next_item"),
+                pl.lit(1, dtype=pl.UInt64).alias("cnt"),
+            ]
+        )
+        del b_joined
+        if b_edges.height > 0:
+            b_edges = b_edges.group_by(["item_id", "next_item"]).agg(pl.col("cnt").sum())
+
+        within = seq.with_columns(
+            pl.col("item_id").shift(-1).over("user_id").alias("next_item"),
+        )
+        within = within.filter(
+            pl.col("next_item").is_not_null() & (pl.col("item_id") != pl.col("next_item"))
+        )
+        w_edges = (
+            within.group_by(["item_id", "next_item"])
+            .len()
+            .rename({"len": "cnt"})
+            .with_columns(pl.col("cnt").cast(pl.UInt64))
+        )
+        del seq, within
+
+        if b_edges.is_empty():
+            chunk_edges = w_edges
+        elif w_edges.is_empty():
+            chunk_edges = b_edges
+        else:
+            chunk_edges = (
+                pl.concat([w_edges, b_edges], how="vertical")
+                .group_by(["item_id", "next_item"])
+                .agg(pl.col("cnt").sum())
+            )
+        del w_edges, b_edges
+
+        if not chunk_edges.is_empty():
+            edge_fold_buf.append(chunk_edges)
+            if len(edge_fold_buf) >= COVIS_EDGE_FOLD_EVERY:
+                flush_edges()
+        del chunk_edges
+        gc.collect()
+
+    flush_edges()
+    if folded is None:
+        all_e = pl.DataFrame(
+            schema={"item_id": pl.UInt32, "next_item": pl.UInt32, "cnt": pl.UInt64},
+        )
+    else:
+        all_e = folded
+
+    if all_e.is_empty():
+        df = pl.DataFrame(schema={"item_id": pl.UInt32, "cand_item_id": pl.UInt32})
+    else:
+        df = (
+            all_e.sort(["item_id", "cnt"], descending=[False, True])
+            .group_by("item_id", maintain_order=True)
+            .head(COVIS_TOP_K)
+            .rename({"next_item": "cand_item_id"})
+        )
+    del all_e, folded
     gc.collect()
     _log_mem("after build_co_visitation")
     logging.info("Co-visitation edges: %s", f"{df.height:,}")
     return df
 
 
-def build_semantic_pools(
+def build_semantic_pools_from_item_pop(
     item_features_path: Path,
-    train_glob: str,
+    item_pop: pl.DataFrame,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Top-50 items per sid_0_y / sid_1_y cluster by train impression count."""
-    item_pop = (
-        pl.scan_parquet(train_glob)
-        .filter(pl.col("timestamp") < CUTOFF_MS)
-        .group_by("item_id")
-        .len()
-        .rename({"len": "pop"})
-    )
-
+    """Top-50 items per sid_0_y / sid_1_y по уже посчитанному item_pop (без повторного чтения train)."""
     items = pl.scan_parquet(str(item_features_path)).select(["item_id", "sid_0_y", "sid_1_y"])
-
-    joined = items.join(item_pop, on="item_id", how="left").with_columns(
+    joined = items.join(item_pop.lazy(), on="item_id", how="left").with_columns(
         pl.col("pop").fill_null(0).cast(pl.Int64)
     )
 
@@ -219,7 +389,6 @@ def build_semantic_pools(
     _log_mem("after build_semantic_pools")
     logging.info("Semantic pools sid_0=%s sid_1=%s rows", pool0.height, pool1.height)
     return pool0, pool1
-
 
 def generate_candidates(
     co_vis: pl.DataFrame,
@@ -406,15 +575,6 @@ def fallback_rows_for_users(
 # ---------------------------------------------------------------------------
 
 
-def build_global_user_item_stats(train_glob: str) -> tuple[pl.DataFrame, pl.DataFrame]:
-    lf = pl.scan_parquet(train_glob).filter(pl.col("timestamp") < CUTOFF_MS)
-    ucnt = lf.group_by("user_id").len().rename({"len": "user_event_cnt"}).collect(streaming=True)
-    icnt = lf.group_by("item_id").len().rename({"len": "item_event_cnt"}).collect(streaming=True)
-    gc.collect()
-    _log_mem("after build_global_user_item_stats")
-    return ucnt, icnt
-
-
 def attach_features(candidates: pl.DataFrame, ucnt: pl.DataFrame, icnt: pl.DataFrame) -> pl.DataFrame:
     return (
         candidates.join(ucnt, on="user_id", how="left")
@@ -572,7 +732,6 @@ def merge_bucket_submissions(
 
 
 def run_pipeline(data_dir: Path, out_csv: Path, *, use_gpu: bool = True) -> None:
-    train_glob = str(data_dir / "train_data" / "*.parquet")
     item_features = data_dir / "item_features.parquet"
     eval_users = data_dir / "eval_users.csv"
     eval_events = data_dir / "eval_user_events.pq"
@@ -586,21 +745,46 @@ def run_pipeline(data_dir: Path, out_csv: Path, *, use_gpu: bool = True) -> None
         if not p.exists():
             raise FileNotFoundError(p)
 
+    paths = _train_parquet_paths(data_dir)
     target_eids = load_target_eids(contact_eids)
 
+    logging.info("Train parquet files=%s (sorted)", len(paths))
+    logging.info("Aggregating item_pop + ucnt + icnt (one pass per file)…")
+    item_pop, ucnt, icnt = _aggregate_train_counts_by_file(paths)
+    gc.collect()
+    _log_mem("after counts aggregate")
+
+    logging.info("Computing nu_items for co-vis…")
+    nu_items = _nu_items_multi_user(paths)
+    gc.collect()
+    _log_mem("after nu_items")
+
     logging.info("Step 1: vertical popularity fallback…")
-    fb_vert = build_vertical_top160_fallback(train_glob, item_features, target_eids)
+    fb_vert = build_vertical_top160_fallback_paths(paths, item_features, target_eids)
+    gc.collect()
+    _log_mem("after fb_vert")
 
     logging.info("Step 2: co-visitation + semantic pools…")
-    co_vis = build_co_visitation(train_glob)
-    pool0, pool1 = build_semantic_pools(item_features, train_glob)
+    co_vis = build_co_visitation_paths(paths, nu_items)
+    del nu_items
+    gc.collect()
+    _log_mem("after co_vis")
+
+    pool0, pool1 = build_semantic_pools_from_item_pop(item_features, item_pop)
+    del item_pop
+    gc.collect()
+    _log_mem("after semantic pools")
+
     generate_candidates(co_vis, pool0, pool1, item_features)
+    gc.collect()
+    _log_mem("after generate_candidates")
 
     logging.info("Step 3: user buckets…")
     user_bucket = build_user_bucket_map(eval_users, eval_events, item_features)
+    gc.collect()
+    _log_mem("after user_bucket")
 
-    logging.info("Step 4–5: global stats + CatBoost…")
-    ucnt, icnt = build_global_user_item_stats(train_glob)
+    logging.info("Step 4–5: CatBoost…")
     models = init_catboost_stubs(use_gpu=use_gpu)
     bucket_to_model = {name: models[i] for i, name in enumerate(BUCKET_NAMES)}
 
@@ -623,6 +807,10 @@ def run_pipeline(data_dir: Path, out_csv: Path, *, use_gpu: bool = True) -> None
         gc.collect()
         _log_mem(f"after bucket {bname}")
 
+    del co_vis, pool0, pool1, ucnt, icnt
+    gc.collect()
+    _log_mem("after all buckets")
+
     out = merge_bucket_submissions(all_parts, eval_users, user_bucket, fb_vert)
     out.write_csv(out_csv)
     logging.info("Wrote %s rows → %s", f"{out.height:,}", out_csv)
@@ -643,11 +831,18 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    ram_gb = int(os.environ.get("TRAIN_HOST_RAM_GB", "128"))
+    n_threads = max(1, ram_gb // 6)
+    os.environ["POLARS_MAX_THREADS"] = str(n_threads)
+    logging.info(
+        "TRAIN_HOST_RAM_GB=%s POLARS_MAX_THREADS=%s",
+        ram_gb,
+        n_threads,
+    )
     try:
         pl.Config.set_fmt_str_lengths(200)
     except Exception:
         pass
-    os.environ.setdefault("POLARS_MAX_THREADS", "28")
     set_random_seed(RANDOM_SEED)
     run_pipeline(
         args.data_dir.expanduser().resolve(),

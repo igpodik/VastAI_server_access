@@ -47,6 +47,12 @@ docker run --rm docker.io/igpodik/avito-cup-train:v1 bash -lc \
 - Каталог: `src/experiments/<EXPERIMENT_NAME>/` (имя задаётся переменной окружения или полем `EXPERIMENT_NAME` в `config.json`)
 - На сервер копируется в `~/avito_cup/run/<EXPERIMENT_NAME>/experiment/`
 
+### Baseline: память и Polars
+
+- **`TRAIN_HOST_RAM_GB`** — оценка RAM хоста в гигабайтах (по умолчанию **128**). В `baseline.py` выставляется **`POLARS_MAX_THREADS = max(1, TRAIN_HOST_RAM_GB // 6)`** (для 128 GiB → **21**), чтобы снизить пик RSS.
+- Train читается **по отсортированным файлам** `train_data/*.parquet`: счётчики (`item_pop`, `ucnt`, `icnt`), fallback по `eid`, co-visitation (со стыковкой последнего `item_id` пользователя между файлами) и семантические пулы строятся без лишних полных `scan` по glob и без больших промежуточных дампов на диск.
+- В [`train_models.sh`](src/scripts/server/train_models.sh) по умолчанию задаётся `TRAIN_HOST_RAM_GB=128`; при другом объёме памяти переопределите переменную перед запуском.
+
 ## Один полный прогон (локально)
 
 ```bash

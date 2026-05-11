@@ -6,6 +6,8 @@ set -euo pipefail
 
 echo "Запускаем обучение и инференс CatBoost..."
 
+export TRAIN_HOST_RAM_GB="${TRAIN_HOST_RAM_GB:-128}"
+
 python -u experiment/baseline.py \
     --data-dir "${HOME}/avito_cup/data" \
     --out submission.csv \
