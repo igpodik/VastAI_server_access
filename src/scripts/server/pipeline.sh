@@ -4,9 +4,10 @@
 #
 # Переменные:
 #   EXPERIMENT_NAME — имя каталога под src/experiments/<имя> (иначе из config.json).
-#   PYTHON — интерпретатор (по умолчанию python3).
+#   PYTHON — интерпретатор (после авто-активации venv по умолчанию python из PATH).
 #
 # Запуск (Git Bash / WSL / Linux):
+#   WSL: cd src/scripts/server && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 #   export EXPERIMENT_NAME=baseline
 #   bash pipeline.sh
 #
@@ -69,24 +70,33 @@ echo "=== [2/6] Запуск инстанса ==="
 
 eval "$("$PYTHON" "$SSH_ENV")"
 
-SSH_BATCH=(
-    ssh
+SSH_BATCH=(ssh)
+if [[ -n "${PIPELINE_SSH_IDENTITY_FILE:-}" ]]; then
+    SSH_BATCH+=(-i "$PIPELINE_SSH_IDENTITY_FILE")
+fi
+SSH_BATCH+=(
     -p "${PIPELINE_SSH_PORT}"
     -o BatchMode=yes
     -o StrictHostKeyChecking=accept-new
     "${PIPELINE_SSH_USER}@${PIPELINE_SSH_HOST}"
 )
 # Псевдо-TTY: потоковый stdout/stderr в локальный терминал (download/train).
-SSH_STREAM=(
-    ssh
-    -tt
+SSH_STREAM=(ssh -tt)
+if [[ -n "${PIPELINE_SSH_IDENTITY_FILE:-}" ]]; then
+    SSH_STREAM+=(-i "$PIPELINE_SSH_IDENTITY_FILE")
+fi
+SSH_STREAM+=(
     -p "${PIPELINE_SSH_PORT}"
     -o BatchMode=yes
     -o StrictHostKeyChecking=accept-new
     "${PIPELINE_SSH_USER}@${PIPELINE_SSH_HOST}"
 )
 
-RSYNC_SSH_CMD="ssh -p ${PIPELINE_SSH_PORT} -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+RSYNC_SSH_CMD="ssh"
+if [[ -n "${PIPELINE_SSH_IDENTITY_FILE:-}" ]]; then
+    RSYNC_SSH_CMD+=" -i $(printf '%q' "$PIPELINE_SSH_IDENTITY_FILE")"
+fi
+RSYNC_SSH_CMD+=" -p $(printf '%q' "$PIPELINE_SSH_PORT") -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 
 echo ""
 echo "=== Синхронизация experiments/${EXPERIMENT_NAME} и скриптов на сервер ==="

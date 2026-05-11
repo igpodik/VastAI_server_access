@@ -1,5 +1,21 @@
 catboost==1.2.7
 lightgbm==4.5.0
-polars==1.17.1
+polars-u64-idx==1.17.1
 scikit-learn==1.5.2
 tqdm==4.67.1
+# Транзитивные (зафиксированы под воспроизводимость образа)
+contourpy==1.3.3
+cycler==0.12.1
+fonttools==4.62.1
+graphviz==0.21
+joblib==1.5.3
+kiwisolver==1.5.0
+matplotlib==3.10.9
+narwhals==2.21.0
+numpy==1.26.4
+pandas==3.0.3
+plotly==6.7.0
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+scipy==1.17.1
+threadpoolctl==3.6.0

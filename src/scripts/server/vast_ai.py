@@ -3,8 +3,6 @@
 Использование:
     python vast_ai.py search              -- найти лучший оффер
     python vast_ai.py start               -- создать инстанс
-    python vast_ai.py data-download       -- выгрузить данные с Яндекс-облака на инстанс
-    python vast_ai.py train               -- запустить обучение
     python vast_ai.py artifacts-download  -- скачать артефакты локально
     python vast_ai.py stop                -- удалить инстанс
 """
@@ -14,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -46,26 +45,7 @@ from config import (
     save_instance_id,
     save_ssh_url,
 )
-
-# ---------------------------------------------------------------------------
-# Yandex Storage dataset URLs
-# ---------------------------------------------------------------------------
-_BASE_URL = "https://storage.yandexcloud.net/datafest2026/datafest_2026_v2_v4"
-_SINGLE_FILES = [
-    "item_features.parquet",
-    "contact_eids.csv",
-    "eval_users.csv",
-    "eval_user_events.zip",
-    "prepare_local_eval.py",
-    "popular.py",
-    "submission_popular.csv",
-]
-_TRAIN_SHARDS = ["000-019", "020-039", "040-059", "060-079", "080-099"]
-
-# Remote workspace paths (on the instance)
-_REMOTE_DATA_DIR = "/workspace/data"
-_REMOTE_RESULTS_DIR = "/workspace/results"
-_REMOTE_TRAIN_SCRIPT = "/workspace/train.py"
+from pipeline_ssh_env import load_ssh_key_path
 
 # Локальная выгрузка с инстанса: src/results/<datetime>/<EXPERIMENT_NAME>/
 _RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
@@ -143,7 +123,7 @@ def _is_rtx_5090(o: dict[str, Any]) -> bool:
     return "5090" in _gpu_name(o)
 
 
-def _allowed_gpu(o: dict[str, Any]) -> bool:
+def _is_preferred_gpu(o: dict[str, Any]) -> bool:
     return _is_rtx_4090(o) or _is_rtx_5090(o)
 
 
@@ -154,9 +134,9 @@ def _disk_ok(o: dict[str, Any]) -> bool:
     return _f(o.get("disk_bw")) >= FAST_DISK_BW_OK_WITHOUT_NVME_LABEL
 
 
-def _base_query(gpu_token: str) -> str:
-    return (
-        f"gpu_name={gpu_token} "
+def _base_query(gpu_token: Optional[str] = None) -> str:
+    """Запрос к search_offers. Без gpu_token — любая видеокарта (остальные пороги те же)."""
+    tail = (
         "num_gpus=1 "
         "verified=true "
         "direct_port_count>=1 "
@@ -169,6 +149,9 @@ def _base_query(gpu_token: str) -> str:
         f"reliability>{MIN_RELIABILITY} "
         "rented=False"
     )
+    if gpu_token:
+        return f"gpu_name={gpu_token} {tail}"
+    return tail
 
 
 def _merge_unique(a: list[dict], b: list[dict]) -> list[dict]:
@@ -183,7 +166,11 @@ def _merge_unique(a: list[dict], b: list[dict]) -> list[dict]:
     return out
 
 
-def _first_failed_criterion(o: dict[str, Any]) -> Optional[tuple[str, str]]:
+def _first_failed_criterion(
+    o: dict[str, Any],
+    *,
+    require_preferred_gpu: bool = True,
+) -> Optional[tuple[str, str]]:
     """Первое несоответствие: (короткий_ключ_группы, подробное сообщение). OK → None."""
     oid = o.get("id")
     if _f(o.get("num_gpus")) != float(NUM_GPUS):
@@ -191,7 +178,7 @@ def _first_failed_criterion(o: dict[str, Any]) -> Optional[tuple[str, str]]:
             "num_gpus",
             f"нужно {NUM_GPUS}, факт {_f(o.get('num_gpus')):.0f} (offer_id={oid})",
         )
-    if not _allowed_gpu(o):
+    if require_preferred_gpu and not _is_preferred_gpu(o):
         return (
             "gpu_family",
             f"нужны RTX 4090 или 5090, факт {_gpu_name(o)!r} (offer_id={oid})",
@@ -263,24 +250,35 @@ def _first_failed_criterion(o: dict[str, Any]) -> Optional[tuple[str, str]]:
     return None
 
 
-def _matches(o: dict[str, Any]) -> bool:
-    return _first_failed_criterion(o) is None
+def _matches(o: dict[str, Any], *, require_preferred_gpu: bool = True) -> bool:
+    return (
+        _first_failed_criterion(o, require_preferred_gpu=require_preferred_gpu)
+        is None
+    )
 
 
-def _report_manual_filter_failures(offers_raw: list[dict[str, Any]]) -> None:
+def _report_manual_filter_failures(
+    offers_raw: list[dict[str, Any]],
+    *,
+    require_preferred_gpu: bool = True,
+) -> None:
     """Печатает сводку по первым отсечениям ручного фильтра в stderr."""
     if not offers_raw:
-        print(
-            "Поиск: API не вернул офферов по запросам RTX_4090 / RTX_5090.",
-            file=sys.stderr,
+        scope = (
+            "RTX_4090 / RTX_5090"
+            if require_preferred_gpu
+            else "расширенный поиск (любая GPU)"
         )
+        print(f"Поиск: API не вернул офферов ({scope}).", file=sys.stderr)
         return
 
     bucket_counts: Counter[str] = Counter()
     example_detail: dict[str, str] = {}
     none_failures = 0
     for o in offers_raw:
-        failed = _first_failed_criterion(o)
+        failed = _first_failed_criterion(
+            o, require_preferred_gpu=require_preferred_gpu
+        )
         if failed is None:
             none_failures += 1
             continue
@@ -340,15 +338,37 @@ def cmd_search(_args: argparse.Namespace) -> None:
 
     raw_4090 = vast.search_offers(query=_base_query("RTX_4090"), **kw)
     raw_5090 = vast.search_offers(query=_base_query("RTX_5090"), **kw)
-    offers_raw = _merge_unique(raw_4090, raw_5090)
+    offers_pref = _merge_unique(raw_4090, raw_5090)
 
-    filtered = [o for o in offers_raw if _matches(o)]
+    filtered = [o for o in offers_pref if _matches(o)]
     filtered.sort(key=_top_rank_tuple, reverse=True)
 
-    print(
-        f"candidates={len(offers_raw)} (4090={len(raw_4090)} + 5090={len(raw_5090)}) "
-        f"filtered={len(filtered)}"
-    )
+    used_fallback = False
+    raw_any: list[dict[str, Any]] = []
+    offers_raw: list[dict[str, Any]] = offers_pref
+
+    if not filtered:
+        print(
+            "Нет подходящих RTX 4090/5090 — расширяем поиск (любая GPU, без gpu_name в запросе).",
+            file=sys.stderr,
+        )
+        raw_any = vast.search_offers(query=_base_query(), **kw)
+        offers_raw = raw_any
+        filtered = [
+            o for o in raw_any if _matches(o, require_preferred_gpu=False)
+        ]
+        filtered.sort(key=_top_rank_tuple, reverse=True)
+        used_fallback = True
+
+    if used_fallback:
+        print(
+            f"candidates={len(offers_raw)} (любая GPU) filtered={len(filtered)}",
+        )
+    else:
+        print(
+            f"candidates={len(offers_pref)} (4090={len(raw_4090)}, 5090={len(raw_5090)}) "
+            f"filtered={len(filtered)}",
+        )
 
     best_4090 = max((o for o in filtered if _is_rtx_4090(o)), key=_top_rank_tuple, default=None)
     best_5090 = max((o for o in filtered if _is_rtx_5090(o)), key=_top_rank_tuple, default=None)
@@ -367,8 +387,17 @@ def cmd_search(_args: argparse.Namespace) -> None:
 
     if not filtered:
         print("No offers match manual filter criteria.", file=sys.stderr)
-        _report_manual_filter_failures(offers_raw)
+        _report_manual_filter_failures(
+            offers_raw,
+            require_preferred_gpu=not used_fallback,
+        )
         sys.exit(1)
+
+    if used_fallback:
+        print(
+            "Использован расширенный поиск: BEST_SERVER_ID — лучший среди любых GPU.",
+            file=sys.stderr,
+        )
 
     _print_top(filtered[0])
     save_best_server_id(int(filtered[0]["id"]))
@@ -405,7 +434,7 @@ def cmd_start(_args: argparse.Namespace) -> None:
     print(f"INSTANCE_ID={instance_id}")
     save_instance_id(int(instance_id))
     print(f"Waiting for instance to start...")
-    timeout = time.time() + 60 * 3  # 3 minutes
+    timeout = time.time() + 60 * 5  # 5 minutes
     while True:
         info = vast.show_instance(id=instance_id)
         status = info.get("actual_status")
@@ -421,30 +450,6 @@ def cmd_start(_args: argparse.Namespace) -> None:
     ssh_url = vast.ssh_url(id=instance_id)
     save_ssh_url(ssh_url)
     print(f"SSH_URL={ssh_url}")
-
-
-def cmd_data_download(_args: argparse.Namespace) -> None:
-    """Скачать датасет с Яндекс-облака на инстанс по SSH."""
-    instance_id = load_instance_id()
-    # TODO: реализовать через SSH-вызов на инстансе:
-    #   ssh <instance> "mkdir -p /workspace/data && cd /workspace/data && ..."
-    #   Список URL:
-    #     {_BASE_URL}/{f} для f in _SINGLE_FILES
-    #     {_BASE_URL}/train_{shard}.zip для shard in _TRAIN_SHARDS
-    print(f"TODO: data-download to instance {instance_id}")
-    print(f"      BASE_URL={_BASE_URL}")
-    print(f"      single files: {_SINGLE_FILES}")
-    print(f"      train shards: {[f'train_{s}.zip' for s in _TRAIN_SHARDS]}")
-    print(f"      remote target: {_REMOTE_DATA_DIR}")
-
-
-def cmd_train(_args: argparse.Namespace) -> None:
-    """Запустить entrypoint обучения на инстансе по SSH."""
-    instance_id = load_instance_id()
-    # TODO: реализовать SSH-вызов:
-    #   ssh <instance> "cd /workspace && python train.py"
-    print(f"TODO: train on instance {instance_id}")
-    print(f"      remote script: {_REMOTE_TRAIN_SCRIPT}")
 
 
 def cmd_artifacts_download(_args: argparse.Namespace) -> None:
@@ -479,9 +484,21 @@ def cmd_artifacts_download(_args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    rsh = (
-        f"ssh -p {port} -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+    ssh_parts = ["ssh"]
+    identity = load_ssh_key_path(_SECRET_ENV)
+    if identity:
+        ssh_parts.extend(["-i", identity])
+    ssh_parts.extend(
+        [
+            "-p",
+            str(port),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+        ]
     )
+    rsh = shlex.join(ssh_parts)
     remote = f"{user}@{host}"
     pulls: list[tuple[str, Path]] = [
         (f"{remote}:~/avito_cup/data/", dest / "avito_cup_data"),
@@ -515,14 +532,12 @@ def cmd_stop(_args: argparse.Namespace) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Управление Vast.ai инстансом (поиск / старт / данные / обучение / артефакты / удаление)",
+        description="Управление Vast.ai инстансом: поиск, старт, артефакты, удаление",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("search", help="Найти лучший оффер и сохранить BEST_SERVER_ID")
     sub.add_parser("start", help="Создать инстанс по BEST_SERVER_ID и дождаться running")
-    sub.add_parser("data-download", help="Скачать датасет с Яндекс-облака на инстанс")
-    sub.add_parser("train", help="Запустить entrypoint обучения на инстансе")
     sub.add_parser("artifacts-download", help="Скачать артефакты в src/results/<datetime>/<experiment>/")
     sub.add_parser("stop", help="Удалить (destroy) инстанс")
 
@@ -532,8 +547,6 @@ def _build_parser() -> argparse.ArgumentParser:
 _COMMANDS = {
     "search": cmd_search,
     "start": cmd_start,
-    "data-download": cmd_data_download,
-    "train": cmd_train,
     "artifacts-download": cmd_artifacts_download,
     "stop": cmd_stop,
 }

@@ -1,0 +1,4 @@
+# Локальный оркестратор Vast (vast_ai.py, pipeline.sh).
+# WSL / Linux (без смешения с Windows-venv):
+#   cd src/scripts/server && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+vastai>=0.2.0

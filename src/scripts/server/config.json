@@ -1,18 +1,18 @@
 {
-  "MAX_HOURLY_USD": 0.6,
+  "MAX_HOURLY_USD": 0.65,
   "MIN_CPU_CORES_EFFECTIVE": 32.0,
   "MIN_DISK_BW": 800.0,
   "FAST_DISK_BW_OK_WITHOUT_NVME_LABEL": 1000.0,
   "MIN_RELIABILITY": 0.97,
-  "DISK_SIZE_GB": 200.0,
+  "DISK_SIZE_GB": 170.0,
   "NUM_GPUS": 1,
   "MIN_CPU_RAM_GB": 128.0,
   "MIN_INET_DOWN_MBPS": 800.0,
   "MIN_INET_UP_MBPS": 800.0,
   "MIN_DIRECT_PORT_COUNT": 1,
   "IMAGE": "docker.io/igpodik/avito-cup-train:v1",
-  "BEST_SERVER_ID": null,
-  "INSTANCE_ID": null,
-  "SSH_URL": null,
+  "BEST_SERVER_ID": 36424880,
+  "INSTANCE_ID": 36563038,
+  "SSH_URL": "ssh://root@ssh3.vast.ai:13038",
   "EXPERIMENT_NAME": "baseline"
 }
