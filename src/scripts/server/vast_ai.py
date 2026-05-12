@@ -1,10 +1,17 @@
 """Единый скрипт управления Vast.ai инстансом.
 
 Использование:
-    python vast_ai.py search              -- найти лучший оффер
-    python vast_ai.py start               -- создать инстанс
-    python vast_ai.py artifacts-download  -- скачать артефакты локально
-    python vast_ai.py stop                -- удалить инстанс
+    python vast_ai.py search               -- найти лучший оффер
+    python vast_ai.py start                -- создать инстанс
+    python vast_ai.py artifacts-download -- скачать артефакты локально (data/ без зеркала Яндекса)
+    python vast_ai.py pause-instance       -- только stop_instance (API)
+    python vast_ai.py destroy-instance     -- только destroy инстанса
+    python vast_ai.py stop                 -- pause-instance + destroy-instance
+
+При ошибке pipeline.sh: сначала **artifacts-download** (пока инстанс running и SSH жив),
+затем **pause-instance**, затем **destroy-instance**. `trap` в pipeline вешается только после
+успешного `eval` SSH — иначе teardown не вызывается. Таймаут ожидания `running` в **start**:
+контракт удаляется через API, **SSH_URL** в config очищается.
 """
 
 from __future__ import annotations
@@ -41,7 +48,6 @@ from config import (
     MIN_RELIABILITY,
     NUM_GPUS,
     load_best_server_id,
-    load_instance_id,
     save_best_server_id,
     save_instance_id,
     save_ssh_url,
@@ -50,6 +56,23 @@ from pipeline_ssh_env import load_ssh_key_path
 
 # Локальная выгрузка с инстанса: src/results/<datetime>/<EXPERIMENT_NAME>/
 _RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
+
+# Исключения при rsync ~/avito_cup/data/ (см. download_data_on_server.sh — не тянуть зеркало с Яндекса).
+_YANDEX_DATA_RSYNC_EXCLUDES: tuple[str, ...] = (
+    "item_features.parquet",
+    "contact_eids.csv",
+    "eval_users.csv",
+    "eval_user_events.zip",
+    "eval_user_events.parquet",
+    "eval_user_events.pq",
+    "prepare_local_eval.py",
+    "popular.py",
+    "submission_popular.csv",
+    "train_data/",
+)
+
+_RSYNC_RETRIES = 3
+_RSYNC_RETRY_DELAY_SEC = 8.0
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -350,6 +373,23 @@ def _make_vast(key: str) -> VastAI:
     return VastAI(api_key=key)
 
 
+def vast_stop_instance(vast: VastAI, instance_id: int) -> dict[str, Any]:
+    """Остановить инстанс через API (state=stopped), без уничтожения диска."""
+    return vast.stop_instance(instance_id)
+
+
+def _read_instance_id_optional() -> Optional[int]:
+    """INSTANCE_ID из config.json; None если нет или файл битый."""
+    try:
+        data = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
+        raw = data.get("INSTANCE_ID")
+        if raw is None:
+            return None
+        return int(raw)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -472,6 +512,15 @@ def cmd_start(_args: argparse.Namespace) -> None:
             break
         if time.time() > timeout:
             print(f"Instance {instance_id} did not start within 5 minutes. Exiting.")
+            try:
+                vast.destroy_instance(id=int(instance_id))
+                print("destroy_instance: контракт зависшего инстанса удалён.")
+            except Exception as de:  # pragma: no cover
+                print(f"destroy_instance после timeout: {de}", file=sys.stderr)
+            try:
+                save_ssh_url("")
+            except Exception:  # pragma: no cover
+                pass
             sys.exit(1)
         time.sleep(10)
 
@@ -482,7 +531,7 @@ def cmd_start(_args: argparse.Namespace) -> None:
 
 
 def cmd_artifacts_download(_args: argparse.Namespace) -> None:
-    """Скачать ~/avito_cup/data и ~/avito_cup/run/<experiment> с инстанса (rsync по SSH)."""
+    """Скачать ~/avito_cup/data (без зеркала Яндекса) и ~/avito_cup/run/<experiment> (rsync по SSH)."""
     cfg = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
     url_s = cfg.get("SSH_URL")
     if not url_s:
@@ -525,34 +574,88 @@ def cmd_artifacts_download(_args: argparse.Namespace) -> None:
             "BatchMode=yes",
             "-o",
             "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=45",
+            "-o",
+            "ServerAliveInterval=25",
+            "-o",
+            "ServerAliveCountMax=6",
         ]
     )
     rsh = shlex.join(ssh_parts)
     remote = f"{user}@{host}"
-    pulls: list[tuple[str, Path]] = [
-        (f"{remote}:~/avito_cup/data/", dest / "avito_cup_data"),
+    pulls: list[tuple[str, Path, bool]] = [
+        (f"{remote}:~/avito_cup/data/", dest / "avito_cup_data", True),
     ]
     if exp:
         pulls.append(
-            (f"{remote}:~/avito_cup/run/{exp}/", dest / "run_bundle"),
+            (f"{remote}:~/avito_cup/run/{exp}/", dest / "run_bundle", False),
         )
 
-    for src_url, dpath in pulls:
+    for src_url, dpath, exclude_yandex_mirror in pulls:
         dpath.mkdir(parents=True, exist_ok=True)
-        cmd = ["rsync", "-avz", "-e", rsh, src_url, str(dpath) + "/"]
-        print(" ".join(cmd))
-        subprocess.run(cmd, check=True)
+        rsync_opts: list[str] = ["-avz"]
+        if exclude_yandex_mirror:
+            for ex in _YANDEX_DATA_RSYNC_EXCLUDES:
+                rsync_opts.extend(["--exclude", ex])
+        cmd = ["rsync", *rsync_opts, "-e", rsh, src_url, str(dpath) + "/"]
+        last_err: Optional[BaseException] = None
+        for attempt in range(1, _RSYNC_RETRIES + 1):
+            print(" ".join(cmd), f"(rsync {attempt}/{_RSYNC_RETRIES})")
+            try:
+                subprocess.run(cmd, check=True)
+                last_err = None
+                break
+            except subprocess.CalledProcessError as e:
+                last_err = e
+                if attempt < _RSYNC_RETRIES:
+                    print(
+                        f"rsync не удался, повтор через {_RSYNC_RETRY_DELAY_SEC:.0f}s...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(_RSYNC_RETRY_DELAY_SEC)
+        if last_err is not None:
+            raise last_err
 
     print(f"Артефакты сохранены в {dest}")
 
 
-def cmd_stop(_args: argparse.Namespace) -> None:
+def cmd_pause_instance(_args: argparse.Namespace) -> None:
+    """Только API stop_instance (state=stopped), без destroy."""
+    iid = _read_instance_id_optional()
+    if iid is None:
+        print("pause-instance: INSTANCE_ID нет в config — пропуск.", file=sys.stderr)
+        return
     key = _load_key(_SECRET_ENV)
-    instance_id = load_instance_id()
     vast = _make_vast(key)
-    print(f"Destroying instance {instance_id}...")
-    result = vast.destroy_instance(id=instance_id)
-    print(f"Destroyed: {result}")
+    print(f"Stopping instance {iid} (API, state=stopped)...")
+    try:
+        out = vast_stop_instance(vast, iid)
+        print(f"stop_instance: {out}")
+    except Exception as e:  # pragma: no cover
+        print(f"stop_instance warning: {e}", file=sys.stderr)
+
+
+def cmd_destroy_instance(_args: argparse.Namespace) -> None:
+    """Только destroy_instance (удаление контракта)."""
+    iid = _read_instance_id_optional()
+    if iid is None:
+        print("destroy-instance: INSTANCE_ID нет в config — пропуск.", file=sys.stderr)
+        return
+    key = _load_key(_SECRET_ENV)
+    vast = _make_vast(key)
+    print(f"Destroying instance {iid}...")
+    try:
+        result = vast.destroy_instance(id=iid)
+        print(f"Destroyed: {result}")
+    except Exception as e:  # pragma: no cover
+        print(f"destroy_instance: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_stop(_args: argparse.Namespace) -> None:
+    cmd_pause_instance(_args)
+    cmd_destroy_instance(_args)
 
 
 # ---------------------------------------------------------------------------
@@ -567,8 +670,22 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("search", help="Найти лучший оффер и сохранить BEST_SERVER_ID")
     sub.add_parser("start", help="Создать инстанс по BEST_SERVER_ID и дождаться running")
-    sub.add_parser("artifacts-download", help="Скачать артефакты в src/results/<datetime>/<experiment>/")
-    sub.add_parser("stop", help="Удалить (destroy) инстанс")
+    sub.add_parser(
+        "artifacts-download",
+        help="Скачать артефакты в src/results/... (data/ без Яндекса, run/ целиком)",
+    )
+    sub.add_parser(
+        "pause-instance",
+        help="Только stop_instance (API), без destroy",
+    )
+    sub.add_parser(
+        "destroy-instance",
+        help="Только destroy инстанса (после pause или если SSH уже недоступен)",
+    )
+    sub.add_parser(
+        "stop",
+        help="pause-instance + destroy-instance",
+    )
 
     return parser
 
@@ -577,6 +694,8 @@ _COMMANDS = {
     "search": cmd_search,
     "start": cmd_start,
     "artifacts-download": cmd_artifacts_download,
+    "pause-instance": cmd_pause_instance,
+    "destroy-instance": cmd_destroy_instance,
     "stop": cmd_stop,
 }
 

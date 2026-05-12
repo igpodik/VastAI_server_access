@@ -44,11 +44,11 @@ if ((${#parts[@]} == 0)); then
 fi
 echo "train_data: ${#parts[@]} parquet-файл(ов)"
 
-python3 -c "import polars; import catboost" 2>/dev/null || {
-  echo "Импорт polars/catboost не удался (нужен обучающий образ и pip-зависимости)." >&2
+python3 -c "import polars; import catboost; import numpy; import pyarrow" 2>/dev/null || {
+  echo "Импорт polars/catboost/numpy/pyarrow не удался (нужен обучающий образ и pip-зависимости)." >&2
   exit 1
 }
-echo "Импорт polars, catboost: OK"
+echo "Импорт polars, catboost, numpy, pyarrow: OK"
 
 if [[ -n "${RUN_DIR}" ]]; then
   if [[ ! -d "${RUN_DIR}" ]]; then

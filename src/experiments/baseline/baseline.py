@@ -4,8 +4,10 @@ AvitoTech ML CUP 2026 — retrieval + ranking baseline (Polars + CatBoost).
 
 Memory discipline:
   - train parquet processed in sorted file chunks (peak RAM ~ one shard + aggregates)
+  - co-vis raw window: [START_MS, CUTOFF_MS) (14 days); folded edges capped per item_id between flushes
   - POLARS_MAX_THREADS = TRAIN_HOST_RAM_GB // 6 (default RAM 128 GiB → 21 threads)
   - gc.collect() after major steps
+  - CatBoost: fit on subsample (CB_MAX_FIT_ROWS), predict in chunks (CB_PRED_CHUNK); proxy RMSE target
 
 Layout: data/train_data/*.parquet, data/item_features.parquet,
         data/eval_users.csv, data/eval_user_events.pq (или .parquet), data/contact_eids.csv
@@ -22,12 +24,13 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
+import numpy as np
 import polars as pl
 
 try:
-    from catboost import CatBoostClassifier
+    from catboost import CatBoostRegressor
 except ImportError:  # pragma: no cover
-    CatBoostClassifier = None  # type: ignore[misc, assignment]
+    CatBoostRegressor = None  # type: ignore[misc, assignment]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -35,6 +38,8 @@ except ImportError:  # pragma: no cover
 
 CUTOFF_UTC = dt.datetime(2026, 4, 15, 0, 0, 0, tzinfo=dt.timezone.utc)
 CUTOFF_MS = int(CUTOFF_UTC.timestamp() * 1000)
+# Окно для co-visitation (и смежных агрегатов): последние 14 суток до cutoff — меньше строк, ниже пик RAM.
+START_MS = CUTOFF_MS - (14 * 24 * 60 * 60 * 1000)
 
 EVAL_VERTICAL_IDS = [0, 2, 3, 4, 5, 7]
 
@@ -50,8 +55,27 @@ FB_PAD_WIDE = SUBMISSION_K * 3
 
 RANDOM_SEED = 42
 
+# CatBoost: subsample fit + chunked predict (ограничение пика RAM на больших бакетах).
+CB_MAX_FIT_ROWS = 350_000
+CB_PRED_CHUNK = 200_000
+CB_ITERATIONS = 120
+CB_DEPTH = 5
+CB_LEARNING_RATE = 0.08
+CB_PROXY_ICNT_WEIGHT = 0.55
+CB_PROXY_UCNT_WEIGHT = 0.45
+CB_FEATURE_COLS: tuple[str, ...] = (
+    "user_event_cnt",
+    "item_event_cnt",
+    "log_user",
+    "log_item",
+    "ui_ratio",
+    "vert_h",
+)
+
 # Сколько файлов train накапливать в списке рёбер co-vis перед слиянием (пик RAM).
 COVIS_EDGE_FOLD_EVERY = 6
+# Жёсткий потолок рёбер на item_id в накопителе co-vis между flush (до финального top-K).
+COVIS_FOLDED_TOP_PER_ITEM = 150
 
 
 def set_random_seed(seed: int = RANDOM_SEED) -> None:
@@ -92,7 +116,12 @@ def _aggregate_train_counts_by_file(paths: list[Path]) -> tuple[pl.DataFrame, pl
         chunk = (
             pl.scan_parquet(str(path))
             .filter(pl.col("timestamp") < CUTOFF_MS)
-            .select(["user_id", "item_id"])
+            .select(
+                [
+                    pl.col("user_id").cast(pl.UInt32),
+                    pl.col("item_id").cast(pl.UInt32),
+                ]
+            )
         )
         ip = (
             chunk.group_by("item_id")
@@ -123,21 +152,49 @@ def _aggregate_train_counts_by_file(paths: list[Path]) -> tuple[pl.DataFrame, pl
 
 
 def _nu_items_multi_user(paths: list[Path]) -> pl.DataFrame:
-    """item_id с числом уникальных user_id ≥ 2 (глобально по train)."""
-    scans = [
-        pl.scan_parquet(str(p))
-        .filter(pl.col("timestamp") < CUTOFF_MS)
-        .select(["item_id", "user_id"])
-        for p in paths
-    ]
-    lf = pl.concat(scans, how="vertical")
-    out = (
-        lf.group_by("item_id")
-        .agg(pl.col("user_id").n_unique().alias("nu"))
-        .filter(pl.col("nu") >= 2)
-        .select("item_id")
-        .collect(streaming=True)
-    )
+    """
+    item_id с числом уникальных user_id ≥ 2 по train.
+
+    По одному parquet за раз (без pl.concat(scans) на 100 LazyFrame — иначе раздувание графа).
+    После каждого файла: локальный ``nu`` = n_unique(user_id) внутри файла; аккумулятор суммирует ``nu``
+    по ``item_id`` (корректно, если пользователи не дублируются между партициями; иначе — консервативная
+    оценка сверху для порога ``nu >= 2`` при типичном шардировании по user).
+    """
+    acc: Optional[pl.DataFrame] = None
+    for path in paths:
+        chunk = (
+            pl.scan_parquet(str(path))
+            .filter(pl.col("timestamp") < CUTOFF_MS)
+            .select(
+                [
+                    pl.col("item_id").cast(pl.UInt32),
+                    pl.col("user_id").cast(pl.UInt32),
+                ]
+            )
+        )
+        part = (
+            chunk.group_by("item_id")
+            .agg(pl.col("user_id").n_unique().alias("nu"))
+            .collect(streaming=True)
+        )
+        del chunk
+        gc.collect()
+        if part.is_empty():
+            del part
+            gc.collect()
+            continue
+        acc = part if acc is None else (
+            pl.concat([acc, part], how="vertical")
+            .group_by("item_id")
+            .agg(pl.col("nu").sum())
+        )
+        del part
+        gc.collect()
+    if acc is None or acc.is_empty():
+        gc.collect()
+        return pl.DataFrame(schema={"item_id": pl.UInt32})
+    out = acc.filter(pl.col("nu") >= 2).select("item_id")
+    del acc
     gc.collect()
     return out
 
@@ -179,13 +236,24 @@ def build_vertical_top160_fallback_paths(
 ) -> pl.DataFrame:
     """Top-160 item_id per vertical_id by contact (eid ∈ target_eids), по файлам train."""
     eid_set = list({int(x) for x in target_eids})
-    items = pl.scan_parquet(str(item_features_path)).select(["item_id", "vertical_id"])
+    items = pl.scan_parquet(str(item_features_path)).select(
+        [
+            pl.col("item_id").cast(pl.UInt32),
+            pl.col("vertical_id"),
+        ]
+    )
     acc: Optional[pl.DataFrame] = None
     for path in paths:
         part = (
             pl.scan_parquet(str(path))
             .filter(pl.col("timestamp") < CUTOFF_MS)
             .filter(pl.col("eid").is_in(eid_set))
+            .select(
+                [
+                    pl.col("item_id").cast(pl.UInt32),
+                    pl.col("eid"),
+                ]
+            )
             .join(items, on="item_id", how="inner")
             .group_by(["vertical_id", "item_id"])
             .agg(pl.len().alias("contact_cnt"))
@@ -244,8 +312,10 @@ def _merge_co_edge_parts(parts: list[pl.DataFrame]) -> pl.DataFrame:
 
 
 def build_co_visitation_paths(paths: list[Path], nu_items: pl.DataFrame) -> pl.DataFrame:
-    """Co-vis по файлам + carry last_item_id; nu_items — глобальный фильтр item_id."""
-    carry = pl.DataFrame(schema={"user_id": pl.UInt32, "last_item_id": pl.UInt32})
+    """Co-vis по файлам; строки в каждом файле уже отсортированы по (user_id, timestamp),
+    каждый пользователь живёт ровно в одной партиции — carry не нужен.
+    nu_items — глобальный фильтр item_id (встречался у ≥ 2 уникальных пользователей).
+    """
     edge_fold_buf: list[pl.DataFrame] = []
     folded: Optional[pl.DataFrame] = None
 
@@ -255,82 +325,61 @@ def build_co_visitation_paths(paths: list[Path], nu_items: pl.DataFrame) -> pl.D
             return
         chunk = _merge_co_edge_parts(edge_fold_buf)
         edge_fold_buf.clear()
-        folded = chunk if folded is None else (
+        merged = chunk if folded is None else (
             pl.concat([folded, chunk], how="vertical")
             .group_by(["item_id", "next_item"])
             .agg(pl.col("cnt").sum())
         )
         del chunk
+        if folded is not None:
+            del folded
+        gc.collect()
+        folded = (
+            merged.sort(["item_id", "cnt"], descending=[False, True])
+            .group_by("item_id", maintain_order=True)
+            .head(COVIS_FOLDED_TOP_PER_ITEM)
+        )
+        del merged
         gc.collect()
 
     for path in paths:
         raw = (
             pl.scan_parquet(str(path))
-            .filter(pl.col("timestamp") < CUTOFF_MS)
-            .select(["user_id", "item_id", "timestamp"])
+            .filter((pl.col("timestamp") >= START_MS) & (pl.col("timestamp") < CUTOFF_MS))
+            .select(
+                [
+                    pl.col("user_id").cast(pl.UInt32),
+                    pl.col("item_id").cast(pl.UInt32),
+                ]
+            )
             .collect(streaming=True)
         )
         if raw.is_empty():
+            del raw
             gc.collect()
             continue
 
-        raw = raw.sort(["user_id", "timestamp"])
-        carry_prev = carry
-        tails = raw.group_by("user_id").agg(pl.col("item_id").last().alias("last_item_id"))
-        users_in_file = tails.select("user_id")
-        carry_from_prev = carry_prev.join(users_in_file, on="user_id", how="anti")
-        carry = pl.concat([carry_from_prev, tails], how="vertical")
-
-        seq = raw.join(nu_items, on="item_id", how="inner").sort(["user_id", "timestamp"])
-        del raw, tails
+        seq = raw.join(nu_items, on="item_id", how="inner")
+        del raw
+        gc.collect()
         if seq.is_empty():
             del seq
             gc.collect()
             continue
 
-        seq = seq.with_columns(
-            (pl.col("user_id") != pl.col("user_id").shift(1)).fill_null(True).alias("_uf"),
-        )
-        b_joined = seq.filter(pl.col("_uf")).join(carry_prev, on="user_id", how="left")
-        b_edges = b_joined.filter(
-            pl.col("last_item_id").is_not_null()
-            & (pl.col("last_item_id") != pl.col("item_id"))
-        ).select(
-            [
-                pl.col("last_item_id").cast(pl.UInt32).alias("item_id"),
-                pl.col("item_id").cast(pl.UInt32).alias("next_item"),
-                pl.lit(1, dtype=pl.UInt64).alias("cnt"),
-            ]
-        )
-        del b_joined
-        if b_edges.height > 0:
-            b_edges = b_edges.group_by(["item_id", "next_item"]).agg(pl.col("cnt").sum())
-
         within = seq.with_columns(
             pl.col("item_id").shift(-1).over("user_id").alias("next_item"),
         )
-        within = within.filter(
-            pl.col("next_item").is_not_null() & (pl.col("item_id") != pl.col("next_item"))
-        )
-        w_edges = (
-            within.group_by(["item_id", "next_item"])
+        chunk_edges = (
+            within.filter(
+                pl.col("next_item").is_not_null() & (pl.col("item_id") != pl.col("next_item"))
+            )
+            .group_by(["item_id", "next_item"])
             .len()
             .rename({"len": "cnt"})
             .with_columns(pl.col("cnt").cast(pl.UInt64))
         )
         del seq, within
-
-        if b_edges.is_empty():
-            chunk_edges = w_edges
-        elif w_edges.is_empty():
-            chunk_edges = b_edges
-        else:
-            chunk_edges = (
-                pl.concat([w_edges, b_edges], how="vertical")
-                .group_by(["item_id", "next_item"])
-                .agg(pl.col("cnt").sum())
-            )
-        del w_edges, b_edges
 
         if not chunk_edges.is_empty():
             edge_fold_buf.append(chunk_edges)
@@ -368,7 +417,13 @@ def build_semantic_pools_from_item_pop(
     item_pop: pl.DataFrame,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Top-50 items per sid_0_y / sid_1_y по уже посчитанному item_pop (без повторного чтения train)."""
-    items = pl.scan_parquet(str(item_features_path)).select(["item_id", "sid_0_y", "sid_1_y"])
+    items = pl.scan_parquet(str(item_features_path)).select(
+        [
+            pl.col("item_id").cast(pl.UInt32),
+            pl.col("sid_0_y"),
+            pl.col("sid_1_y"),
+        ]
+    )
     joined = items.join(item_pop.lazy(), on="item_id", how="left").with_columns(
         pl.col("pop").fill_null(0).cast(pl.Int64)
     )
@@ -396,7 +451,7 @@ def generate_candidates(
     pool_sid1: pl.DataFrame,
     item_features_path: Path,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    _ = pl.scan_parquet(str(item_features_path))
+    _ = pl.scan_parquet(str(item_features_path)).select(pl.col("item_id").cast(pl.UInt32))
     return co_vis, pool_sid0, pool_sid1
 
 
@@ -415,10 +470,21 @@ def build_user_bucket_map(
     If max_share >= 0.9 → bucket = map(vertical); else holdout.
     """
     users = pl.scan_csv(str(eval_users_path)).select(pl.col("user_id").cast(pl.UInt32).unique())
-    items = pl.scan_parquet(str(item_features_path)).select(["item_id", "vertical_id"])
+    items = pl.scan_parquet(str(item_features_path)).select(
+        [
+            pl.col("item_id").cast(pl.UInt32),
+            pl.col("vertical_id"),
+        ]
+    )
 
     hist = (
         pl.scan_parquet(str(eval_events_path))
+        .select(
+            [
+                pl.col("user_id").cast(pl.UInt32),
+                pl.col("item_id").cast(pl.UInt32),
+            ]
+        )
         .join(users, on="user_id", how="inner")
         .join(items, on="item_id", how="inner")
         .filter(pl.col("vertical_id").is_in(EVAL_VERTICAL_IDS))
@@ -459,7 +525,17 @@ def build_user_bucket_map(
 
 
 def _last_items_per_user(eval_events_path: Path, user_ids: pl.Series) -> pl.DataFrame:
-    ev = pl.scan_parquet(str(eval_events_path)).filter(pl.col("user_id").is_in(user_ids))
+    ev = (
+        pl.scan_parquet(str(eval_events_path))
+        .filter(pl.col("user_id").is_in(user_ids))
+        .select(
+            [
+                pl.col("user_id").cast(pl.UInt32),
+                pl.col("item_id").cast(pl.UInt32),
+                pl.col("timestamp"),
+            ]
+        )
+    )
     last_ts = ev.group_by("user_id").agg(pl.max("timestamp").alias("mx"))
     last_items = (
         ev.join(last_ts, on="user_id")
@@ -520,9 +596,13 @@ def candidates_for_bucket(
     hist = (
         pl.scan_parquet(str(eval_events_path))
         .filter(pl.col("user_id").is_in(uids))
-        .select(["user_id", "item_id"])
+        .select(
+            [
+                pl.col("user_id").cast(pl.UInt32),
+                pl.col("item_id").cast(pl.UInt32),
+            ]
+        )
         .unique()
-        .with_columns([pl.col("user_id").cast(pl.UInt32), pl.col("item_id").cast(pl.UInt32)])
     )
 
     out = cand.join(hist.collect(streaming=True), on=["user_id", "item_id"], how="anti").unique()
@@ -571,56 +651,108 @@ def fallback_rows_for_users(
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — features + CatBoost stubs
+# Step 5 — features + CatBoost (subsample RMSE proxy, chunked predict)
 # ---------------------------------------------------------------------------
 
 
-def attach_features(candidates: pl.DataFrame, ucnt: pl.DataFrame, icnt: pl.DataFrame) -> pl.DataFrame:
+def attach_features(
+    candidates: pl.DataFrame,
+    ucnt: pl.DataFrame,
+    icnt: pl.DataFrame,
+    item_features_path: Path,
+) -> pl.DataFrame:
+    """Join ucnt/icnt + item vertical; числовые фичи Float32 (без лишних колонок в CB_FEATURE_COLS)."""
+    items = pl.read_parquet(
+        str(item_features_path),
+        columns=["item_id", "vertical_id"],
+    )
     return (
         candidates.join(ucnt, on="user_id", how="left")
         .join(icnt, on="item_id", how="left")
+        .join(items, on="item_id", how="left")
         .with_columns(
             [
                 pl.col("user_event_cnt").fill_null(0).cast(pl.Float32),
                 pl.col("item_event_cnt").fill_null(0).cast(pl.Float32),
             ]
         )
+        .with_columns(
+            [
+                (pl.col("user_event_cnt") + 1.0).log().cast(pl.Float32).alias("log_user"),
+                (pl.col("item_event_cnt") + 1.0).log().cast(pl.Float32).alias("log_item"),
+                ((pl.col("user_event_cnt") + 1.0) / (pl.col("item_event_cnt") + 1.0))
+                .cast(pl.Float32)
+                .alias("ui_ratio"),
+                pl.col("vertical_id")
+                .fill_null(-1)
+                .hash(seed=RANDOM_SEED)
+                .mod(243)
+                .cast(pl.Float32)
+                .alias("vert_h"),
+            ]
+        )
+        .drop("vertical_id")
     )
 
 
-def init_catboost_stubs(*, use_gpu: bool = True) -> list[CatBoostClassifier]:
-    if CatBoostClassifier is None:
+def fit_catboost_bucket_model(
+    feat: pl.DataFrame,
+    bname: str,
+    *,
+    use_gpu: bool,
+) -> CatBoostRegressor:
+    """Обучение на subsample; proxy-y без разметки соревнования (лог-смесь счётчиков)."""
+    if CatBoostRegressor is None:
         raise RuntimeError("catboost is not installed")
-    task = "GPU" if use_gpu else "CPU"
+    seed = RANDOM_SEED + (hash(bname) & 0xFFFF)
+    n_fit = min(CB_MAX_FIT_ROWS, feat.height)
+    subs = feat.sample(n=n_fit, shuffle=True, seed=seed)
+    uc = subs["user_event_cnt"].to_numpy().astype(np.float64, copy=False)
+    ic = subs["item_event_cnt"].to_numpy().astype(np.float64, copy=False)
+    y = CB_PROXY_ICNT_WEIGHT * np.log1p(ic) + CB_PROXY_UCNT_WEIGHT * np.log1p(uc)
+    X = subs.select(CB_FEATURE_COLS).to_numpy().astype(np.float64, copy=False)
+    del subs
+    gc.collect()
+
+    def _fit(task: str) -> CatBoostRegressor:
+        m = CatBoostRegressor(
+            iterations=CB_ITERATIONS,
+            depth=CB_DEPTH,
+            learning_rate=CB_LEARNING_RATE,
+            loss_function="RMSE",
+            verbose=False,
+            task_type=task,
+            allow_writing_files=False,
+            random_seed=seed,
+        )
+        m.fit(X, y)
+        return m
+
     try:
-        models: list[CatBoostClassifier] = []
-        for i in range(N_BUCKETS):
-            m = CatBoostClassifier(
-                iterations=3,
-                depth=4,
-                loss_function="Logloss",
-                verbose=False,
-                task_type=task,
-                allow_writing_files=False,
-                random_seed=RANDOM_SEED + i,
-            )
-            tiny_X = pl.DataFrame(
-                {"user_event_cnt": [0.0, 100.0, 5.0], "item_event_cnt": [0.0, 2.0, 50.0]}
-            ).to_pandas()
-            m.fit(tiny_X, [0, 1, 0])
-            models.append(m)
-        logging.info("CatBoost stubs ready (%s)", task)
-        return models
+        model = _fit("GPU" if use_gpu else "CPU")
     except Exception as e:  # pragma: no cover
-        logging.warning("CatBoost GPU failed (%s); CPU fallback.", e)
-        return init_catboost_stubs(use_gpu=False)
+        if use_gpu:
+            logging.warning("CatBoostRegressor GPU failed (%s); CPU fallback.", e)
+            model = _fit("CPU")
+        else:
+            logging.exception("CatBoostRegressor failed on CPU")
+            raise
+    del X, y
+    gc.collect()
+    logging.info("CatBoost bucket=%s fit rows=%s", bname, n_fit)
+    return model
 
 
-def score_candidates(df: pl.DataFrame, model: CatBoostClassifier) -> pl.DataFrame:
+def score_candidates(df: pl.DataFrame, model: CatBoostRegressor) -> pl.DataFrame:
     if df.is_empty():
         return df.with_columns(pl.lit(0.5).alias("score"))
-    X = df.select(["user_event_cnt", "item_event_cnt"]).to_pandas()
-    proba = model.predict_proba(X)[:, 1]
+    parts: list[np.ndarray] = []
+    for start in range(0, df.height, CB_PRED_CHUNK):
+        h = min(CB_PRED_CHUNK, df.height - start)
+        sl = df.slice(start, h)
+        x = sl.select(CB_FEATURE_COLS).cast(pl.Float32).to_numpy().astype(np.float64, copy=False)
+        parts.append(np.asarray(model.predict(x), dtype=np.float64))
+    proba = np.concatenate(parts)
     return df.with_columns(pl.Series("score", proba))
 
 
@@ -785,8 +917,8 @@ def run_pipeline(data_dir: Path, out_csv: Path, *, use_gpu: bool = True) -> None
     _log_mem("after user_bucket")
 
     logging.info("Step 4–5: CatBoost…")
-    models = init_catboost_stubs(use_gpu=use_gpu)
-    bucket_to_model = {name: models[i] for i, name in enumerate(BUCKET_NAMES)}
+    if CatBoostRegressor is None:
+        raise RuntimeError("catboost is not installed")
 
     all_parts: list[pl.DataFrame] = []
     for bname in BUCKET_NAMES:
@@ -799,9 +931,14 @@ def run_pipeline(data_dir: Path, out_csv: Path, *, use_gpu: bool = True) -> None
         if cand.is_empty():
             part = fallback_rows_for_users(bu, fb_vert)
         else:
-            feat = attach_features(cand, ucnt, icnt)
-            scored = score_candidates(feat, bucket_to_model[bname])
+            feat = attach_features(cand, ucnt, icnt, item_features)
+            model = fit_catboost_bucket_model(feat, bname, use_gpu=use_gpu)
+            scored = score_candidates(feat, model)
+            del model
+            gc.collect()
             part = pad_scored_to_submission(scored, bu, fb_vert)
+            del feat, scored
+            gc.collect()
 
         all_parts.append(part)
         gc.collect()

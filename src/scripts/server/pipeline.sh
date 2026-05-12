@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Локальный оркестратор Vast.ai: search → start → rsync → download → verify → train →
+# Локальный оркестратор Vast.ai: search → start → eval SSH → trap(cleanup) → rsync → …
 # артефакты → destroy инстанса.
 #
 # Переменные:
@@ -20,17 +20,6 @@ SSH_ENV="$SCRIPT_DIR/pipeline_ssh_env.py"
 
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 LOCAL_EXPERIMENTS="$REPO_ROOT/src/experiments"
-
-# ---------------------------------------------------------------------------
-cleanup() {
-    local exit_code=$?
-    if [[ $exit_code -ne 0 ]]; then
-        echo ""
-        echo "!!! Ошибка (exit_code=$exit_code). Пытаемся удалить инстанс..."
-        "$PYTHON" "$VAST" stop || echo "Не удалось выполнить stop — удалите инстанс вручную."
-    fi
-}
-trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # EXPERIMENT_NAME: из окружения или из config.json (без SSH).
@@ -58,6 +47,11 @@ if [[ ! -d "$LOCAL_EXP" ]]; then
     exit 1
 fi
 
+if ! "$PYTHON" -c "import vastai" 2>/dev/null; then
+    echo "Нет пакета vastai для $PYTHON. Установите: pip install -r ${SCRIPT_DIR}/requirements.txt" >&2
+    exit 1
+fi
+
 REMOTE_RUN="~/avito_cup/run/${EXPERIMENT_NAME}"
 
 echo ""
@@ -70,6 +64,24 @@ echo "=== [2/7] Запуск инстанса ==="
 
 eval "$("$PYTHON" "$SSH_ENV")"
 
+# Только после успешного SSH: teardown не трогает чужие INSTANCE_ID из прошлых прогонов.
+cleanup() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        echo ""
+        echo "!!! Ошибка (exit_code=$exit_code)."
+        if [[ -z "${PIPELINE_SSH_HOST:-}" ]]; then
+            echo "PIPELINE_SSH_HOST пуст — пропуск artifacts/pause/destroy (инстанс не дошёл до eval SSH)."
+            return 0
+        fi
+        echo "artifacts-download → pause-instance → destroy-instance..."
+        EXPERIMENT_NAME="${EXPERIMENT_NAME:-}" "$PYTHON" "$VAST" artifacts-download || echo "Не удалось artifacts-download (проверьте SSH_URL и доступ по SSH)."
+        "$PYTHON" "$VAST" pause-instance || echo "Не удалось pause-instance."
+        "$PYTHON" "$VAST" destroy-instance || echo "Не удалось destroy-instance — удалите инстанс вручную на Vast."
+    fi
+}
+trap cleanup EXIT
+
 SSH_BATCH=(ssh)
 if [[ -n "${PIPELINE_SSH_IDENTITY_FILE:-}" ]]; then
     SSH_BATCH+=(-i "$PIPELINE_SSH_IDENTITY_FILE")
@@ -78,6 +90,9 @@ SSH_BATCH+=(
     -p "${PIPELINE_SSH_PORT}"
     -o BatchMode=yes
     -o StrictHostKeyChecking=accept-new
+    -o ConnectTimeout=45
+    -o ServerAliveInterval=25
+    -o ServerAliveCountMax=6
     "${PIPELINE_SSH_USER}@${PIPELINE_SSH_HOST}"
 )
 # Псевдо-TTY: потоковый stdout/stderr в локальный терминал (download/train).
@@ -89,6 +104,9 @@ SSH_STREAM+=(
     -p "${PIPELINE_SSH_PORT}"
     -o BatchMode=yes
     -o StrictHostKeyChecking=accept-new
+    -o ConnectTimeout=45
+    -o ServerAliveInterval=25
+    -o ServerAliveCountMax=6
     "${PIPELINE_SSH_USER}@${PIPELINE_SSH_HOST}"
 )
 
@@ -96,7 +114,7 @@ RSYNC_SSH_CMD="ssh"
 if [[ -n "${PIPELINE_SSH_IDENTITY_FILE:-}" ]]; then
     RSYNC_SSH_CMD+=" -i $(printf '%q' "$PIPELINE_SSH_IDENTITY_FILE")"
 fi
-RSYNC_SSH_CMD+=" -p $(printf '%q' "$PIPELINE_SSH_PORT") -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+RSYNC_SSH_CMD+=" -p $(printf '%q' "$PIPELINE_SSH_PORT") -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=45 -o ServerAliveInterval=25 -o ServerAliveCountMax=6"
 
 echo ""
 echo "=== Синхронизация experiments/${EXPERIMENT_NAME} и скриптов на сервер ==="
