@@ -5,9 +5,15 @@ RUN apt-get update \
         ca-certificates \
         curl \
         unzip \
+        gcc \
+        g++ \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
+
+# lightfm требует компиляции; conda-forge предоставляет готовый wheel
+RUN conda install -y -c conda-forge lightfm=1.17 \
+    && conda clean -afy
 
 COPY docker/requirements-train.txt /tmp/requirements-train.txt
 RUN pip install --no-cache-dir --upgrade pip \
