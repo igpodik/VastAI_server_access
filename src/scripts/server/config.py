@@ -1,7 +1,5 @@
 """Настройки: значения читаются из config.json при импорте модуля."""
 
-from __future__ import annotations
-
 import json
 from pathlib import Path
 from typing import Any, Final, Optional
@@ -21,6 +19,7 @@ _KEYS_FLOAT = (
     "MIN_INET_UP_MBPS",
     "MIN_DIRECT_PORT_COUNT",
     "MIN_CUDA_MAX_GOOD",
+    "MAX_INET_COST_PER_GB",
 )
 _KEYS_STR = ("IMAGE",)
 
@@ -54,6 +53,7 @@ NUM_GPUS: int = int(_data["NUM_GPUS"])
 MIN_CPU_RAM_GB: float = float(_data["MIN_CPU_RAM_GB"])
 MIN_INET_DOWN_MBPS: float = float(_data["MIN_INET_DOWN_MBPS"])
 MIN_INET_UP_MBPS: float = float(_data["MIN_INET_UP_MBPS"])
+MAX_INET_COST_PER_GB: float = float(_data["MAX_INET_COST_PER_GB"])
 MIN_DIRECT_PORT_COUNT: int = int(_data["MIN_DIRECT_PORT_COUNT"])
 MIN_CUDA_MAX_GOOD: float = float(_data["MIN_CUDA_MAX_GOOD"])
 IMAGE: str = str(_data["IMAGE"])
@@ -73,6 +73,11 @@ SSH_URL: Optional[str] = None if _ssh_raw is None else str(_ssh_raw)
 
 _experiment_raw: Any = _data.get("EXPERIMENT_NAME")
 EXPERIMENT_NAME: str = "" if _experiment_raw is None else str(_experiment_raw)
+
+_bl_raw: Any = _data.get("BLACKLISTED_OFFER_IDS")
+BLACKLISTED_OFFER_IDS: frozenset[int] = (
+    frozenset() if not _bl_raw else frozenset(int(x) for x in _bl_raw)
+)
 
 
 def save_best_server_id(offer_id: int) -> None:

@@ -14,11 +14,10 @@
 контракт удаляется через API, **SSH_URL** в config очищается.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -33,11 +32,13 @@ from urllib.parse import urlparse
 from vastai import VastAI
 
 from config import (
+    BLACKLISTED_OFFER_IDS,
     CONFIG_JSON_PATH,
     DISK_SIZE_GB,
     FAST_DISK_BW_OK_WITHOUT_NVME_LABEL,
     IMAGE,
     MAX_HOURLY_USD,
+    MAX_INET_COST_PER_GB,
     MIN_CPU_CORES_EFFECTIVE,
     MIN_CPU_RAM_GB,
     MIN_CUDA_MAX_GOOD,
@@ -151,6 +152,29 @@ def _is_preferred_gpu(o: dict[str, Any]) -> bool:
     return _is_rtx_4090(o) or _is_rtx_5090(o)
 
 
+# Xeon E3/E5/E7 v1 (Sandy Bridge, ~2012) и v2 (Ivy Bridge, ~2013) не поддерживают AVX2.
+# Haswell v3/v4, EPYC, Ryzen, Xeon Scalable — все с AVX2.
+# Паттерн: «E[357]-<цифры> v1» или «E[357]-<цифры> v2» (word boundary).
+_NO_AVX2_RE = re.compile(r"\bE[357]-\d+\s+v[12]\b", re.IGNORECASE)
+
+
+def _cpu_avx2_ok(o: dict[str, Any]) -> bool:
+    """Возвращает False для заведомо pre-AVX2 CPU (Sandy/Ivy Bridge v1/v2)."""
+    cpu_name = str(o.get("cpu_name") or "")
+    return not bool(_NO_AVX2_RE.search(cpu_name))
+
+
+def _inet_cost_per_gb(o: dict[str, Any]) -> float:
+    """Максимальная стоимость интернет-трафика $/GB (upload или download).
+
+    Vast.ai хранит её в inet_up_billed / inet_down_billed (float, $/GB).
+    Если поле отсутствует или равно None — считаем трафик бесплатным (0.0).
+    """
+    up = _f(o.get("inet_up_billed"), default=0.0)
+    down = _f(o.get("inet_down_billed"), default=0.0)
+    return max(up, down)
+
+
 def _disk_ok(o: dict[str, Any]) -> bool:
     disk_name = str(o.get("disk_name") or "").lower()
     if "nvme" in disk_name:
@@ -205,6 +229,11 @@ def _first_failed_criterion(
     после остальных критериев — отдельным шагом по уже полученным офферам, без cuda_vers в API-запросе.
     """
     oid = o.get("id")
+    if oid is not None and int(oid) in BLACKLISTED_OFFER_IDS:
+        return (
+            "blacklisted",
+            f"offer_id={oid} в BLACKLISTED_OFFER_IDS (config.json) — исключён вручную",
+        )
     if _f(o.get("num_gpus")) != float(NUM_GPUS):
         return (
             "num_gpus",
@@ -269,6 +298,14 @@ def _first_failed_criterion(
             f"мин down {MIN_INET_DOWN_MBPS}, up {MIN_INET_UP_MBPS}; "
             f"факт down {inet_d:.0f}, up {inet_u:.0f} (offer_id={oid})",
         )
+    _inet_cost = _inet_cost_per_gb(o)
+    if _inet_cost > MAX_INET_COST_PER_GB:
+        return (
+            "inet_cost_per_gb",
+            f"стоимость трафика {_inet_cost:.4f} $/GB > макс {MAX_INET_COST_PER_GB} $/GB "
+            f"(inet_up_billed={o.get('inet_up_billed')}, inet_down_billed={o.get('inet_down_billed')}, "
+            f"offer_id={oid})",
+        )
     if _hourly_total_usd(o) > MAX_HOURLY_USD:
         return (
             "hourly_usd",
@@ -290,6 +327,12 @@ def _first_failed_criterion(
             "cuda_max_good",
             f"хост cuda_max_good {_f(cuda_mg):.2f} < MIN_CUDA_MAX_GOOD {MIN_CUDA_MAX_GOOD} "
             f"(runtime Docker), offer_id={oid}",
+        )
+    if not _cpu_avx2_ok(o):
+        return (
+            "cpu_no_avx2",
+            f"CPU {o.get('cpu_name')!r} — Sandy/Ivy Bridge (v1/v2), нет AVX2; "
+            f"Docker-образ (polars/numpy/catboost) упадёт с SIGILL (offer_id={oid})",
         )
     return None
 
@@ -365,7 +408,7 @@ def _print_top(o: dict[str, Any]) -> None:
     )
     print(f"  cpu: {o.get('cpu_name')}  cores_eff={_f(o.get('cpu_cores_effective')):.3g}  ram_gb={_cpu_ram_gb(o):.1f}")
     print(f"  disk: {o.get('disk_name')}  space_gb={_f(o.get('disk_space')):.1f}  bw={_f(o.get('disk_bw')):.0f}")
-    print(f"  net: down={_f(o.get('inet_down')):.0f}  up={_f(o.get('inet_up')):.0f}")
+    print(f"  net: down={_f(o.get('inet_down')):.0f}  up={_f(o.get('inet_up')):.0f}  inet_cost={_inet_cost_per_gb(o):.4f}$/GB")
     print(f"  price={_hourly_total_usd(o):.4f}$/h  rel={_f(o.get('reliability')):.5f}  geo={o.get('geolocation')}")
 
 

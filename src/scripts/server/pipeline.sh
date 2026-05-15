@@ -1,16 +1,5 @@
 #!/usr/bin/env bash
-# Локальный оркестратор Vast.ai: search → start → eval SSH → trap(cleanup) → rsync → …
-# артефакты → destroy инстанса.
-#
-# Переменные:
-#   EXPERIMENT_NAME — имя каталога под src/experiments/<имя> (иначе из config.json).
-#   PYTHON — интерпретатор (после авто-активации venv по умолчанию python из PATH).
-#
-# Запуск (Git Bash / WSL / Linux):
-#   WSL: cd src/scripts/server && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
-#   export EXPERIMENT_NAME=baseline
-#   bash pipeline.sh
-#
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -119,7 +108,7 @@ RSYNC_SSH_CMD+=" -p $(printf '%q' "$PIPELINE_SSH_PORT") -o BatchMode=yes -o Stri
 echo ""
 echo "=== Синхронизация experiments/${EXPERIMENT_NAME} и скриптов на сервер ==="
 "${SSH_BATCH[@]}" "mkdir -p ${REMOTE_RUN}/experiment"
-rsync -avz --mkpath -e "$RSYNC_SSH_CMD" \
+rsync -avz -e "$RSYNC_SSH_CMD" \
     "${LOCAL_EXP}/" \
     "${PIPELINE_SSH_USER}@${PIPELINE_SSH_HOST}:${REMOTE_RUN}/experiment/"
 for _f in download_data_on_server.sh train_models.sh verify_baseline_prereqs.sh; do
@@ -130,18 +119,41 @@ done
 "${SSH_BATCH[@]}" "chmod +x ${REMOTE_RUN}/download_data_on_server.sh ${REMOTE_RUN}/train_models.sh ${REMOTE_RUN}/verify_baseline_prereqs.sh"
 
 echo ""
+echo "=== [2.5/7] Проверка совместимости CPU (AVX2) ==="
+"${SSH_BATCH[@]}" "grep -q avx2 /proc/cpuinfo || { echo 'ОШИБКА: CPU не поддерживает AVX2 — несовместим с Docker-образом (polars/numpy/catboost требуют AVX2). Выберите другой сервер.' >&2; exit 1; }; echo CPU_AVX2_OK"
+
+echo ""
 echo "=== [3/7] Скачивание данных на инстансе (SSH, лог в реальном времени) ==="
 "${SSH_STREAM[@]}" env PYTHONUNBUFFERED=1 bash -lc \
     "set -euo pipefail; cd ${REMOTE_RUN} && exec bash ./download_data_on_server.sh"
 
 echo ""
-echo "=== [4/7] Проверка данных и окружения (baseline, без обучения) ==="
-"${SSH_STREAM[@]}" env PYTHONUNBUFFERED=1 bash -lc \
+echo "=== [4/7] Проверка данных и окружения (без обучения) ==="
+"${SSH_STREAM[@]}" env PYTHONUNBUFFERED=1 EXPERIMENT_NAME="${EXPERIMENT_NAME}" bash -lc \
     "set -euo pipefail; cd ${REMOTE_RUN} && DATA_DIR=\$HOME/avito_cup/data RUN_DIR=\$HOME/avito_cup/run/${EXPERIMENT_NAME} bash ./verify_baseline_prereqs.sh"
 
 echo ""
-echo "=== [5/7] Обучение на инстансе (SSH, лог в реальном времени) ==="
-"${SSH_STREAM[@]}" env PYTHONUNBUFFERED=1 bash -lc \
+echo "=== [5a/7] Фаза features: retrieval + feature engineering → сохранение матриц CatBoost ==="
+"${SSH_STREAM[@]}" env PYTHONUNBUFFERED=1 TRAINING_PHASE=features EXPERIMENT_NAME="${EXPERIMENT_NAME}" bash -lc \
+    "set -euo pipefail; cd ${REMOTE_RUN} && exec bash ./train_models.sh"
+
+echo ""
+echo "=== [5b/7] Скачивание матриц CatBoost локально (перед обучением) ==="
+_CB_MATRICES_DIR="${SCRIPT_DIR}/../../results/catboost_matrices"
+mkdir -p "${_CB_MATRICES_DIR}"
+for _snap in catboost_train_matrix.parquet catboost_feat_matrix.parquet; do
+    rsync -az \
+        -e "$RSYNC_SSH_CMD" \
+        "${PIPELINE_SSH_USER}@${PIPELINE_SSH_HOST}:${REMOTE_RUN}/${_snap}" \
+        "${_CB_MATRICES_DIR}/" \
+        && echo "  OK: ${_snap}" \
+        || echo "  WARN: не удалось скачать ${_snap} (продолжаем)"
+done
+echo "Матрицы CatBoost → $(cd "${_CB_MATRICES_DIR}" && pwd)"
+
+echo ""
+echo "=== [5c/7] Фаза rank: обучение CatBoost + предсказание → submission ==="
+"${SSH_STREAM[@]}" env PYTHONUNBUFFERED=1 TRAINING_PHASE=rank EXPERIMENT_NAME="${EXPERIMENT_NAME}" bash -lc \
     "set -euo pipefail; cd ${REMOTE_RUN} && exec bash ./train_models.sh"
 
 echo ""

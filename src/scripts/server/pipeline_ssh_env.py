@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""Печатает в stdout строки `export ...` для eval в pipeline.sh (SSH из config.json)."""
-
-from __future__ import annotations
 
 import json
 import shlex
